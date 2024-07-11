@@ -1,7 +1,7 @@
 package main
 
 import (
-    "pqs/src/LedgerClient"
+    "mercury/src/LedgerClient"
     "flag"
 )
 

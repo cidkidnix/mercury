@@ -1,4 +1,4 @@
-module pqs
+module mercury
 
 go 1.22.3
 
