@@ -34,6 +34,7 @@ type CreateEventWrapper struct {
   ContractID string
   Witnesses []string
   Observers []string
+  Signatories []string
   TemplateId *v1.Identifier
   Offset string
 }
@@ -135,8 +136,12 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
   }
 }
 
+func (ledgerContext *LedgerContext) LogInfo(message string) {
+  log.Printf("\033[0;35m[INFO]\033[0m %s", message)
+}
+
 func (ledgerContext *LedgerContext) LogDebug(message string) {
-  log.Printf("\033[0;34m[INFO]\033[0m %s", message)
+  log.Printf("\033[0;34m[DEBUG]]\033[0m %s", message)
 }
 
 func (ledgerContext *LedgerContext) LogContract(message string) {
@@ -256,7 +261,7 @@ func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
           },
         }
       } else {
-        log.Printf("Starting from Offset: %s", lOffset.Offset)
+        ledgerContext.LogInfo(fmt.Sprintf("Starting from Offset: %s", lOffset.Offset))
         offset = &v1.LedgerOffset {
           Value: &v1.LedgerOffset_Absolute {
             Absolute: lOffset.Offset,
@@ -265,7 +270,7 @@ func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
       }
       return offset
     default:
-      log.Printf("Start Point %s Not Supported! Starting from OLDEST", ledgerContext.StartPoint)
+      ledgerContext.LogInfo(fmt.Sprintf("Start Point %s Not Supported! Starting from OLDEST", ledgerContext.StartPoint))
       db := ledgerContext.GetDatabaseConnection()
       var lOffset Database.LastOffset
       lastOffset := db.Last(&lOffset)
@@ -310,7 +315,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
     partyMap[value] = &v1.Filters{}
   }
   pipelineParties,  _ := json.Marshal(parties)
-  log.Printf("Staring pipeline on behalf of Parties: %v", string(pipelineParties))
+  ledgerContext.LogInfo(fmt.Sprintf("Staring pipeline on behalf of Parties: %v", string(pipelineParties)))
 
   client := v1.NewTransactionServiceClient(connection.connection)
   response, err := client.GetTransactions(*connection.ctx, &v1.GetTransactionsRequest {
@@ -319,6 +324,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
       FiltersByParty: partyMap,
     },
     Begin: offset,
+    Verbose: true,
   })
   if err != nil {
     panic(err)
@@ -346,6 +352,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
             fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
             w, _ := json.Marshal(x.Witnesses)
             o, _ := json.Marshal(x.Observers)
+            s, _ := json.Marshal(x.Signatories)
             dbCommitChannel <- func()() {
                 db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID, }, Database.CreatesTable { ContractID: x.ContractID })
             }
@@ -356,6 +363,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
                   ContractID: x.ContractID,
                   Observers: o,
                   Witnesses: w,
+                  Signatories: s,
                   TemplateFqn: fTid,
                   Offset: x.Offset,
               }, Database.ContractTable { ContractID: x.ContractID })
@@ -387,6 +395,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
                 TemplateId: created.TemplateId,
                 Witnesses: created.WitnessParties,
                 Observers: created.Observers,
+                Signatories: created.Signatories,
                 Offset: value.Offset,
             }
 
@@ -537,7 +546,7 @@ func (ledgerContext *LedgerContext) GetLedgerId() string {
     if err != nil {
       log.Fatalf("Failed to get ledger identity")
     }
-    log.Printf("Ledger ID: %s", response.LedgerId)
+    ledgerContext.LogInfo(fmt.Sprintf("Ledger ID: %s", response.LedgerId))
     return response.LedgerId
 }
 

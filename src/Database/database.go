@@ -17,9 +17,10 @@ type ContractTable struct {
     ContractID string `gorm:"index:contracts_idx_contract_id,unique"`
     ContractKey []byte
     CreateArguments []byte
-    TemplateFqn string
+    TemplateFqn string `gorm:"index:contracts_idx_template_fqn"`
     Witnesses []byte
     Observers []byte
+    Signatories []byte
     Offset string
 }
 

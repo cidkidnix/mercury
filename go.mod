@@ -5,6 +5,7 @@ go 1.22.3
 require (
 	github.com/digital-asset/dazl-client/v7 v7.10.5-0.20240413053419-09e3d0293cd3
 	google.golang.org/grpc v1.56.3
+	google.golang.org/protobuf v1.33.0
 	gorm.io/driver/sqlite v1.5.6
 	gorm.io/gorm v1.25.7-0.20240204074919-46816ad31dde
 )
@@ -17,6 +18,5 @@ require (
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect
-	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20230526161137-0005af68ea54 // indirect
 )
