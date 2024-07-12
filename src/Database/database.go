@@ -16,10 +16,14 @@ type LastOffset struct {
     Id int32
 }
 
+func (LastOffset) TableName() string {
+  return "__offset"
+}
+
 type ContractTable struct {
     ContractID string `gorm:"index:contracts_idx_contract_id,unique"`
     ContractKey []byte `gorm:"type:jsonb"`
-    CreateArguments []byte
+    CreateArguments []byte `gorm:"type:jsonb"`
     TemplateFqn string `gorm:"index:contracts_idx_template_fqn"`
     Witnesses []byte
     Observers []byte
@@ -52,7 +56,13 @@ func MigrateTables(db *gorm.DB) () {
   db.AutoMigrate(&ContractTable{})
   db.AutoMigrate(&ArchivesTable{})
   db.AutoMigrate(&CreatesTable{})
-  db.AutoMigrate(&LastOffset{})
+
+  hasOldOffset := db.Migrator().HasTable("last_offsets")
+  if hasOldOffset {
+    db.Migrator().RenameTable("last_offsets", "__offset")
+  } else {
+    db.AutoMigrate(&LastOffset{})
+  }
 }
 
 func InitializeSQLiteDB() (db *gorm.DB) {

@@ -70,6 +70,11 @@ type ConnectionWrapper struct {
   cancelCtx context.CancelFunc
 }
 
+type ChannelWrapper struct {
+  reciever chan(any)
+  finished chan(bool)
+}
+
 type wrappedStream struct {
 	grpc.ClientStream
 }
@@ -287,6 +292,30 @@ func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
         }
       }
       return offset
+    case "LATEST":
+      db := ledgerContext.GetDatabaseConnection()
+      var lOffset Database.LastOffset
+      lastOffset := db.Last(&lOffset)
+
+      var offset *v1.LedgerOffset
+
+      if lastOffset.Error != nil {
+        offset =  &v1.LedgerOffset {
+          Value: &v1.LedgerOffset_Absolute {
+            Absolute: ledgerContext.GetActiveContractSet(),
+          },
+        }
+      } else {
+        ledgerContext.LogInfo(fmt.Sprintf("Starting from Offset: %s", lOffset.Offset))
+        offset = &v1.LedgerOffset {
+          Value: &v1.LedgerOffset_Absolute {
+            Absolute: lOffset.Offset,
+          },
+        }
+      }
+
+
+      return offset
     default:
       ledgerContext.LogInfo(fmt.Sprintf("Start Point %s Not Supported! Starting from OLDEST", ledgerContext.StartPoint))
       log.Printf("Starting from Offset: %s", ledgerContext.StartPoint)
@@ -413,14 +442,20 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
 
   go func() {
     for {
-      x := <-dbCommitChannel
+      x, more := <-dbCommitChannel
+      if !more {
+        return
+      }
       x()
     }
   }()
   go func() {
     for {
         select {
-          case x := <-createChannel:
+          case x, more := <-createChannel:
+            if !more {
+              return
+            }
             ledgerContext.LogContract(fmt.Sprintf("Create ContractID: %s", x.ContractID))
             cKey := ledgerContext.BetterJSON(x.ContractKey)
             cKeyS, _ := json.Marshal(cKey)
@@ -453,11 +488,14 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
               }, Database.ContractTable { ContractID: x.ContractID })
             }
             dbCommitChannel <- func()() {
-              db.FirstOrCreate(&Database.LastOffset{ Offset: x.Offset }, Database.LastOffset{ Offset: x.Offset })
+              db.Save(&Database.LastOffset{ Id: 1, Offset: x.Offset })
             }
-          case y := <-archiveChannel:
+          case y, more := <-archiveChannel:
+            if !more {
+              return
+            }
             dbCommitChannel <- func()() {
-              ledgerContext.LogContract(fmt.Sprintf("Found Archive with ContractID: %s", y.ContractId))
+              db.Save(&Database.LastOffset{ Id: 1, Offset: y.Offset })
               db.FirstOrCreate(&Database.ArchivesTable { ContractID: y.ContractId, Offset: y.Offset }, Database.ArchivesTable { ContractID: y.ContractId })
             }
         }
@@ -495,7 +533,18 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
     }
 
     if err != nil {
-        panic(err)
+      switch err.Error() {
+        case "Aborted":
+          ledgerContext.LogInfo(fmt.Sprintf("gRPC connection aborted, error message %s", err))
+          ledgerContext.LogInfo("Cleaning up and reattempting connection")
+          connection.connection.Close()
+          close(dbCommitChannel)
+          close(createChannel)
+          close(archiveChannel)
+          ledgerContext.WatchTransactionStream()
+        default:
+          panic(err)
+      }
     }
   }
 }
@@ -683,10 +732,11 @@ func (ledgerContext *LedgerContext) GetPartiesSandbox() (allParties []string) {
   return partyList
 }
 
-func (ledgerContext *LedgerContext) GetActiveContractSet() {
-    connection := ledgerContext.GetConnection()
-    defer connection.cancelCtx()
+func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
+    connection := ledgerContext.GetConnectionWithoutTimeout()
     defer connection.connection.Close()
+
+    db := ledgerContext.GetDatabaseConnection()
 
     ledgerId := ledgerContext.GetLedgerId()
     parties := ledgerContext.GetParties()
@@ -702,6 +752,7 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() {
       Filter: &v1.TransactionFilter{
         FiltersByParty: partyMap,
       },
+      Verbose: true,
     })
     if err != nil {
         log.Fatalf("%s", err)
@@ -709,10 +760,45 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() {
     for {
       resp, err := response.Recv()
       if err == io.EOF {
-          return
+        panic("Didn't get offset, bailing")
       } else if err == nil {
         for _, value := range resp.ActiveContracts {
             log.Printf("Found Contract in ACS: %s", value.ContractId)
+            db.FirstOrCreate(&Database.CreatesTable {
+              ContractID: value.ContractId,
+            }, &Database.CreatesTable { ContractID: value.ContractId })
+            cKey := ledgerContext.BetterJSON(value.ContractKey)
+            cKeyS, _ := json.Marshal(cKey)
+            createArgs := ledgerContext.BetterJSON(&v1.Value {
+              Sum: &v1.Value_Record {
+                Record: value.CreateArguments,
+              },
+            })
+            createArgsS, _ := json.Marshal(createArgs)
+            tid := value.TemplateId
+            fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
+            w, _ := json.Marshal(value.WitnessParties)
+            o, _ := json.Marshal(value.Observers)
+            s, _ := json.Marshal(value.Signatories)
+            db.FirstOrCreate(&Database.ContractTable {
+              CreateArguments: createArgsS,
+              ContractKey: cKeyS,
+              ContractID: value.ContractId,
+              Observers: o,
+              Witnesses: w,
+              Signatories: s,
+              TemplateFqn: fTid,
+              Offset: "replaceme", // We don't know the offset at this point in time until after the fact, we replace this later
+           }, Database.ContractTable { ContractID: value.ContractId })
+        }
+        if resp.Offset != "" {
+          log.Printf("Offset: %s", resp.Offset)
+          db.Model(&Database.ContractTable{}).Where("offset = ?", "replaceme").Update("offset", resp.Offset)
+          db.Create(&Database.LastOffset{
+            Id: 1,
+            Offset: resp.Offset,
+          })
+          return resp.Offset
         }
       }
 
@@ -720,4 +806,5 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() {
           panic(err)
       }
     }
+    return ""
 }
