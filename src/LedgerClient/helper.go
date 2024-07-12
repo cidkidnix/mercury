@@ -271,29 +271,87 @@ func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
       return offset
     default:
       ledgerContext.LogInfo(fmt.Sprintf("Start Point %s Not Supported! Starting from OLDEST", ledgerContext.StartPoint))
-      db := ledgerContext.GetDatabaseConnection()
-      var lOffset Database.LastOffset
-      lastOffset := db.Last(&lOffset)
-
-
-      var offset *v1.LedgerOffset
-
-      if lastOffset.Error != nil {
-        offset = &v1.LedgerOffset {
-          Value: &v1.LedgerOffset_Boundary {
-            Boundary: v1.LedgerOffset_LEDGER_BEGIN,
-          },
-        }
-      } else {
-        log.Printf("Starting from Offset: %s", lOffset.Offset)
-        offset = &v1.LedgerOffset {
-          Value: &v1.LedgerOffset_Absolute {
-            Absolute: lOffset.Offset,
-          },
-        }
+      log.Printf("Starting from Offset: %s", ledgerContext.StartPoint)
+      offset := &v1.LedgerOffset {
+        Value: &v1.LedgerOffset_Absolute {
+          Absolute: ledgerContext.StartPoint,
+        },
       }
       return offset
   }
+}
+
+func (ledgerContext *LedgerContext) BetterJSON(value *v1.Value) (any) {
+  switch x := value.GetSum().(type) {
+    case (*v1.Value_Record):
+      record := x.Record
+      nMap := make(map[string]any)
+      if record != nil {
+        fields := record.GetFields()
+        if fields != nil {
+          for _, v := range(fields) {
+            nMap[v.Label] = ledgerContext.BetterJSON(v.Value)
+          }
+        }
+      }
+      return nMap
+
+    case (*v1.Value_Party):
+      return x.Party
+    case (*v1.Value_Text):
+      return x.Text
+    case (*v1.Value_List):
+      var lMap [](any)
+      for _, v := range(x.List.Elements) {
+        lMap = append(lMap,  ledgerContext.BetterJSON(v))
+      }
+      return lMap
+    case (*v1.Value_Date):
+      return x.Date
+    case (*v1.Value_Optional):
+      return(ledgerContext.BetterJSON(x.Optional.Value))
+    case (*v1.Value_Int64):
+      return x.Int64
+    case (*v1.Value_Numeric):
+      return x.Numeric
+    case (*v1.Value_Timestamp):
+      return x.Timestamp
+    case (*v1.Value_Bool):
+      return x.Bool
+    case (*v1.Value_ContractId):
+      return x.ContractId
+    case (*v1.Value_Map):
+      newMap := make(map[string]any)
+      for _, v := range(x.Map.Entries) {
+        newMap[v.Key] = ledgerContext.BetterJSON(v.Value)
+      }
+      panic("Got a map")
+      return newMap
+    case (*v1.Value_GenMap):
+      var mapList [](map[string]any)
+      for _, v := range(x.GenMap.Entries) {
+        newMap := make(map[string]any)
+        newMap["key"] = ledgerContext.BetterJSON(v.Key)
+        newMap["value"] = ledgerContext.BetterJSON(v.Value)
+        mapList = append(mapList, newMap)
+      }
+      return mapList
+    case (*v1.Value_Variant):
+      newMap := make(map[string]any)
+      newMap["type"] = x.Variant.VariantId.EntityName
+      newMap["constructor"] = x.Variant.Constructor
+      l := ledgerContext.BetterJSON(x.Variant.Value)
+      newMap["value"] = l
+      return newMap
+    case (*v1.Value_Enum):
+      newMap := make(map[string]any)
+      newMap["type"] = x.Enum.EnumId.EntityName
+      newMap["constructor"] = x.Enum.Constructor
+      return newMap
+    case (*v1.Value_Unit):
+      return "unit{}"
+  }
+  return nil
 }
 
 func (ledgerContext *LedgerContext) WatchTransactionStream() {
@@ -346,20 +404,28 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
         select {
           case x := <-createChannel:
             ledgerContext.LogContract(fmt.Sprintf("Create ContractID: %s", x.ContractID))
-            cKey, _ := protojson.Marshal(x.ContractKey)
-            createArgs, _ := protojson.Marshal(x.CreateArguments)
+            cKey := ledgerContext.BetterJSON(x.ContractKey)
+            cKeyS, _ := json.Marshal(cKey)
+            log.Printf("TMAP: %s", cKeyS)
+            //cKey, _ := protojson.Marshal(x.ContractKey)
+            createArgs := ledgerContext.BetterJSON(&v1.Value {
+                Sum: &v1.Value_Record {
+                    Record: x.CreateArguments,
+                },
+            })
+            createArgsS, _ := json.Marshal(createArgs)
             tid := x.TemplateId
             fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
             w, _ := json.Marshal(x.Witnesses)
             o, _ := json.Marshal(x.Observers)
             s, _ := json.Marshal(x.Signatories)
             dbCommitChannel <- func()() {
-                db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID, }, Database.CreatesTable { ContractID: x.ContractID })
+                db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID }, Database.CreatesTable { ContractID: x.ContractID })
             }
             dbCommitChannel <- func()() {
               db.FirstOrCreate(&Database.ContractTable{
-                  CreateArguments: createArgs,
-                  ContractKey: cKey,
+                  CreateArguments: createArgsS,
+                  ContractKey: cKeyS,
                   ContractID: x.ContractID,
                   Observers: o,
                   Witnesses: w,

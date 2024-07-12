@@ -9,8 +9,8 @@ import (
 
 
 type LastOffset struct {
-    Id int32
     Offset string `gorm:"index:offset_idx_offset,unique"`
+    Id int32
 }
 
 type ContractTable struct {
