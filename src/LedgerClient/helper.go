@@ -5,7 +5,6 @@ import (
     "io"
     "time"
     "google.golang.org/grpc"
-    "google.golang.org/protobuf/encoding/protojson"
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1"
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1/admin"
     "google.golang.org/grpc/metadata"
@@ -17,6 +16,16 @@ import (
     "gorm.io/gorm"
     "os"
 )
+
+
+type DatabaseConnection struct {
+  Host *string
+  User *string
+  Password *string
+  Dbname *string
+  Port *int
+  Sslmode *string
+}
 
 type LedgerOffsetWrapper struct {
   Boundary *v1.LedgerOffset_Boundary
@@ -52,6 +61,7 @@ type LedgerContext struct {
   LedgerId string
   StartPoint string
   DB *gorm.DB
+  DBConnection *DatabaseConnection
 }
 
 type ConnectionWrapper struct {
@@ -101,7 +111,7 @@ func genUnaryInterceptor(token string) func(ctx context.Context, method string, 
   }
 }
 
-func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, applicationId *string, startPoint *string) (ledgerContext LedgerContext) {
+func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, applicationId *string, startPoint *string, dbConnection *DatabaseConnection) (ledgerContext LedgerContext) {
   return LedgerContext{
       GetConnectionWithoutTimeout: func() (ConnectionWrapper) {
         ctx := context.Background()
@@ -132,6 +142,7 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
       ApplicationId: *applicationId,
       LedgerId: "",
       StartPoint: *startPoint,
+      DBConnection: dbConnection,
       DB: nil,
   }
 }
@@ -227,14 +238,21 @@ func (ledgerContext *LedgerContext) FetchFromTransactionServiceByEventId(eventId
   }
 
   return response.Transaction
-
 }
 
 func (ledgerContext *LedgerContext) GetDatabaseConnection() *gorm.DB {
   if ledgerContext.DB != nil {
     return(ledgerContext.DB)
   }
-  db := Database.InitializeDB()
+
+  var db *gorm.DB
+  if ledgerContext.DBConnection != nil {
+    dbCon := ledgerContext.DBConnection
+    db = Database.InitializePostgresDB(*dbCon.Host, *dbCon.User, *dbCon.Password, *dbCon.Dbname, *dbCon.Port, *dbCon.Sslmode)
+  } else {
+    db = Database.InitializeSQLiteDB()
+  }
+  ledgerContext.DB = db
   return(db)
 }
 
@@ -481,106 +499,106 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
     }
   }
 }
-func (ledgerContext *LedgerContext) WatchCommandService() {
-  connection := ledgerContext.GetConnectionWithoutTimeout()
-  defer connection.connection.Close()
-
-  var parties []string
-  ledgerId := ledgerContext.GetLedgerId()
-  ledgerContext.LedgerId = ledgerId
-  parties = ledgerContext.GetParties()
-  client := v1.NewCommandCompletionServiceClient(connection.connection)
-  response, err := client.CompletionStream(*connection.ctx, &v1.CompletionStreamRequest{
-    LedgerId: ledgerId,
-    Parties: parties,
-    ApplicationId: ledgerContext.ApplicationId,
-    Offset: &v1.LedgerOffset {
-      Value: &v1.LedgerOffset_Boundary {
-          Boundary: v1.LedgerOffset_LEDGER_BEGIN,
-      },
-    },
-  })
-
-  db := Database.InitializeDB()
-  if err != nil {
-    panic(err)
-  }
-  channel := make(chan CreateEventWrapper)
-  exerciseChannel := make(chan ExercisedEventWrapper)
-  dbCommitChannel := make(chan func()())
-  go func() {
-    for {
-      x := <-dbCommitChannel
-      x()
-    }
-  }()
-  go func() {
-    for {
-        select {
-          case x := <-channel:
-            log.Printf("Found Create with ContractID: %s", x.ContractID)
-            event := ledgerContext.GetEventByContractId(parties, x.ContractID)
-            dbCommitChannel <- func()() { db.Create(&Database.CreatesTable{ ContractID: x.ContractID, }) }
-            if event.GetArchiveEvent() == nil {
-                cKey, _ := protojson.Marshal(x.ContractKey)
-                createArgs, _ := protojson.Marshal(x.CreateArguments)
-                tid := x.TemplateId
-                fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
-                w, _ := json.Marshal(x.Witnesses)
-                o, _ := json.Marshal(x.Observers)
-                dbCommitChannel <- func()() {
-                  db.Create(&Database.ContractTable{
-                      CreateArguments: createArgs,
-                      ContractKey: cKey,
-                      ContractID: x.ContractID,
-                      Observers: o,
-                      Witnesses: w,
-                      TemplateFqn: fTid,
-                  })
-                }
-
-            } else {
-              log.Printf("ContractID: %s has been archived", x.ContractID)
-              dbCommitChannel <- func()() {
-                db.Create(&Database.ArchivesTable {
-                  ContractID: x.ContractID,
-                })
-              }
-            }
-          case exercised := <-exerciseChannel:
-                if exercised.Consuming {
-                  dbCommitChannel <- func()() {
-                    db.Where("contract_id = ?", exercised.ContractID).Delete(&Database.ContractTable{})
-                  }
-                }
-                log.Printf("Got event %s", exercised)
-        }
-        log.Printf("Waiting for next event")
-
-    }
-  }()
-  for {
-    resp, err := response.Recv()
-    if err == io.EOF {
-        return
-    } else if err == nil {
-      for _, value := range resp.Completions {
-          log.Printf("Dedup period: %s", value.DeduplicationPeriod)
-          if value.TransactionId == "" {
-            log.Printf("Failed to pull transaction %s, Reason: %s", value.TransactionId, value.Status)
-          } else {
-            transaction := ledgerContext.FetchFromTransactionServiceById(value.TransactionId, parties)
-            var t []string
-            ledgerContext.TraverseTransactionTreeEvents(parties, transaction, t, channel, exerciseChannel)
-          }
-      }
-    }
-
-    if err != nil {
-        panic(err)
-    }
-  }
-}
+//func (ledgerContext *LedgerContext) WatchCommandService() {
+//  connection := ledgerContext.GetConnectionWithoutTimeout()
+//  defer connection.connection.Close()
+//
+//  var parties []string
+//  ledgerId := ledgerContext.GetLedgerId()
+//  ledgerContext.LedgerId = ledgerId
+//  parties = ledgerContext.GetParties()
+//  client := v1.NewCommandCompletionServiceClient(connection.connection)
+//  response, err := client.CompletionStream(*connection.ctx, &v1.CompletionStreamRequest{
+//    LedgerId: ledgerId,
+//    Parties: parties,
+//    ApplicationId: ledgerContext.ApplicationId,
+//    Offset: &v1.LedgerOffset {
+//      Value: &v1.LedgerOffset_Boundary {
+//          Boundary: v1.LedgerOffset_LEDGER_BEGIN,
+//      },
+//    },
+//  })
+//
+//  db := Database.InitializeDB()
+//  if err != nil {
+//    panic(err)
+//  }
+//  channel := make(chan CreateEventWrapper)
+//  exerciseChannel := make(chan ExercisedEventWrapper)
+//  dbCommitChannel := make(chan func()())
+//  go func() {
+//    for {
+//      x := <-dbCommitChannel
+//      x()
+//    }
+//  }()
+//  go func() {
+//    for {
+//        select {
+//          case x := <-channel:
+//            log.Printf("Found Create with ContractID: %s", x.ContractID)
+//            event := ledgerContext.GetEventByContractId(parties, x.ContractID)
+//            dbCommitChannel <- func()() { db.Create(&Database.CreatesTable{ ContractID: x.ContractID, }) }
+//            if event.GetArchiveEvent() == nil {
+//                cKey, _ := protojson.Marshal(x.ContractKey)
+//                createArgs, _ := protojson.Marshal(x.CreateArguments)
+//                tid := x.TemplateId
+//                fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
+//                w, _ := json.Marshal(x.Witnesses)
+//                o, _ := json.Marshal(x.Observers)
+//                dbCommitChannel <- func()() {
+//                  db.Create(&Database.ContractTable{
+//                      CreateArguments: createArgs,
+//                      ContractKey: cKey,
+//                      ContractID: x.ContractID,
+//                      Observers: o,
+//                      Witnesses: w,
+//                      TemplateFqn: fTid,
+//                  })
+//                }
+//
+//            } else {
+//              log.Printf("ContractID: %s has been archived", x.ContractID)
+//              dbCommitChannel <- func()() {
+//                db.Create(&Database.ArchivesTable {
+//                  ContractID: x.ContractID,
+//                })
+//              }
+//            }
+//          case exercised := <-exerciseChannel:
+//                if exercised.Consuming {
+//                  dbCommitChannel <- func()() {
+//                    db.Where("contract_id = ?", exercised.ContractID).Delete(&Database.ContractTable{})
+//                  }
+//                }
+//                log.Printf("Got event %s", exercised)
+//        }
+//        log.Printf("Waiting for next event")
+//
+//    }
+//  }()
+//  for {
+//    resp, err := response.Recv()
+//    if err == io.EOF {
+//        return
+//    } else if err == nil {
+//      for _, value := range resp.Completions {
+//          log.Printf("Dedup period: %s", value.DeduplicationPeriod)
+//          if value.TransactionId == "" {
+//            log.Printf("Failed to pull transaction %s, Reason: %s", value.TransactionId, value.Status)
+//          } else {
+//            transaction := ledgerContext.FetchFromTransactionServiceById(value.TransactionId, parties)
+//            var t []string
+//            ledgerContext.TraverseTransactionTreeEvents(parties, transaction, t, channel, exerciseChannel)
+//          }
+//      }
+//    }
+//
+//    if err != nil {
+//        panic(err)
+//    }
+//  }
+//}
 
 func (ledgerContext *LedgerContext) GetEventByContractId(parties []string, contractId string) (events *v1.GetEventsByContractIdResponse) {
   connection := ledgerContext.GetConnection()
