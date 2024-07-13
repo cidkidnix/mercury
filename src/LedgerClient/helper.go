@@ -15,6 +15,7 @@ import (
     "fmt"
     "gorm.io/gorm"
     "os"
+    "reflect"
 )
 
 
@@ -164,6 +165,15 @@ func (ledgerContext *LedgerContext) LogContract(message string) {
   enableContractLog := os.Getenv("LOG_CONTRACT")
   if enableContractLog == "1" {
     log.Printf("\033[0;36m[CONTRACT]\033[0m %s", message)
+  }
+}
+
+func IsHashable(kind reflect.Kind) bool {
+  switch kind {
+    case reflect.String:
+      return true
+    default:
+      return false
   }
 }
 
@@ -328,7 +338,7 @@ func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
   }
 }
 
-func (ledgerContext *LedgerContext) BetterJSON(value *v1.Value) (any) {
+func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
   switch x := value.GetSum().(type) {
     case (*v1.Value_Record):
       record := x.Record
@@ -337,7 +347,7 @@ func (ledgerContext *LedgerContext) BetterJSON(value *v1.Value) (any) {
         fields := record.GetFields()
         if fields != nil {
           for _, v := range(fields) {
-            nMap[v.Label] = ledgerContext.BetterJSON(v.Value)
+            nMap[v.Label] = ledgerContext.ParseLedgerData(v.Value)
           }
         }
       }
@@ -348,15 +358,27 @@ func (ledgerContext *LedgerContext) BetterJSON(value *v1.Value) (any) {
     case (*v1.Value_Text):
       return x.Text
     case (*v1.Value_List):
-      var lMap [](any)
-      for _, v := range(x.List.Elements) {
-        lMap = append(lMap,  ledgerContext.BetterJSON(v))
+      emptyMap := make(map[string]any)
+      if x.List.Elements != nil {
+        var lMap [](any)
+        for _, v := range(x.List.Elements) {
+          lMap = append(lMap,  ledgerContext.ParseLedgerData(v))
+        }
+        return lMap
+      } else {
+        return emptyMap
       }
-      return lMap
     case (*v1.Value_Date):
       return x.Date
     case (*v1.Value_Optional):
-      return(ledgerContext.BetterJSON(x.Optional.Value))
+      newMap := make(map[string]any)
+      emptyMap := make(map[string]any)
+      if x.Optional.GetValue() != nil {
+        newMap["Some"] = ledgerContext.ParseLedgerData(x.Optional.Value)
+      } else {
+        newMap["None"] = emptyMap
+      }
+      return newMap
     case (*v1.Value_Int64):
       return x.Int64
     case (*v1.Value_Numeric):
@@ -370,34 +392,54 @@ func (ledgerContext *LedgerContext) BetterJSON(value *v1.Value) (any) {
     case (*v1.Value_Map):
       newMap := make(map[string]any)
       for _, v := range(x.Map.Entries) {
-        newMap[v.Key] = ledgerContext.BetterJSON(v.Value)
+        newMap[v.Key] = ledgerContext.ParseLedgerData(v.Value)
       }
-      panic("Got a map")
       return newMap
     case (*v1.Value_GenMap):
       var mapList [](map[string]any)
+      tMap := make(map[string]any)
       for _, v := range(x.GenMap.Entries) {
         newMap := make(map[string]any)
-        newMap["key"] = ledgerContext.BetterJSON(v.Key)
-        newMap["value"] = ledgerContext.BetterJSON(v.Value)
-        mapList = append(mapList, newMap)
+        keyVal := ledgerContext.ParseLedgerData(v.Key)
+        keyKind := reflect.TypeOf(keyVal).Kind()
+        // Decode the GenMap into a regular Map if our keys are hashable and are not empty
+        if IsHashable(keyKind) && keyVal.(string) != "" {
+          tMap[keyVal.(string)] = ledgerContext.ParseLedgerData(v.Value)
+        } else {
+          newMap["key"] = ledgerContext.ParseLedgerData(v.Key)
+          newMap["value"] = ledgerContext.ParseLedgerData(v.Value)
+        }
+
+        if len(newMap) > 0 {
+          mapList = append(mapList, newMap)
+        }
       }
-      return mapList
+      // Make sure we append the correct bits into the list (if applicable)
+      if (len(mapList) > 0) {
+        if (len(tMap) > 0) {
+          mapList = append(mapList, tMap)
+        }
+        return mapList
+      } else {
+        return tMap
+      }
+
     case (*v1.Value_Variant):
       newMap := make(map[string]any)
-      newMap["type"] = x.Variant.VariantId.EntityName
-      newMap["constructor"] = x.Variant.Constructor
-      l := ledgerContext.BetterJSON(x.Variant.Value)
-      newMap["value"] = l
+      newMap[x.Variant.Constructor] = ledgerContext.ParseLedgerData(x.Variant.Value)
       return newMap
     case (*v1.Value_Enum):
-      newMap := make(map[string]any)
-      newMap["type"] = x.Enum.EnumId.EntityName
-      newMap["constructor"] = x.Enum.Constructor
-      return newMap
+      return x.Enum.Constructor
     case (*v1.Value_Unit):
-      return "unit{}"
+      emptyMap := make(map[string]any)
+      return emptyMap
   }
+  if value == nil {
+    emptyMap := make(map[string]any)
+    return emptyMap
+  }
+  panic(fmt.Sprintf("%s", value))
+  // We should never hit this case, which is why panic is produced above
   return nil
 }
 
@@ -457,11 +499,10 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
               return
             }
             ledgerContext.LogContract(fmt.Sprintf("Create ContractID: %s", x.ContractID))
-            cKey := ledgerContext.BetterJSON(x.ContractKey)
+            cKey := ledgerContext.ParseLedgerData(x.ContractKey)
             cKeyS, _ := json.Marshal(cKey)
-            log.Printf("TMAP: %s", cKeyS)
             //cKey, _ := protojson.Marshal(x.ContractKey)
-            createArgs := ledgerContext.BetterJSON(&v1.Value {
+            createArgs := ledgerContext.ParseLedgerData(&v1.Value {
                 Sum: &v1.Value_Record {
                     Record: x.CreateArguments,
                 },
@@ -495,17 +536,15 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
               return
             }
             dbCommitChannel <- func()() {
-              db.Save(&Database.LastOffset{ Id: 1, Offset: y.Offset })
               db.FirstOrCreate(&Database.ArchivesTable { ContractID: y.ContractId, Offset: y.Offset }, Database.ArchivesTable { ContractID: y.ContractId })
+              db.Save(&Database.LastOffset{ Id: 1, Offset: y.Offset })
             }
         }
     }
   }()
   for {
     resp, err := response.Recv()
-    if err == io.EOF {
-        return
-    } else if err == nil {
+    if err == nil {
       for _, value := range resp.Transactions {
         for _, data := range value.Events {
           created := data.GetCreated()
@@ -767,9 +806,9 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
             db.FirstOrCreate(&Database.CreatesTable {
               ContractID: value.ContractId,
             }, &Database.CreatesTable { ContractID: value.ContractId })
-            cKey := ledgerContext.BetterJSON(value.ContractKey)
+            cKey := ledgerContext.ParseLedgerData(value.ContractKey)
             cKeyS, _ := json.Marshal(cKey)
-            createArgs := ledgerContext.BetterJSON(&v1.Value {
+            createArgs := ledgerContext.ParseLedgerData(&v1.Value {
               Sum: &v1.Value_Record {
                 Record: value.CreateArguments,
               },
