@@ -5,17 +5,20 @@ import (
     "io"
     "time"
     "google.golang.org/grpc"
+    "google.golang.org/grpc/status"
+    "google.golang.org/grpc/codes"
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1"
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1/admin"
-    "google.golang.org/grpc/metadata"
     "context"
     "slices"
     "mercury/src/Database"
+    "mercury/src/GRPCClient"
+    "mercury/src/Config"
     "encoding/json"
     "fmt"
     "gorm.io/gorm"
-    "os"
     "reflect"
+    "strconv"
 )
 
 
@@ -26,11 +29,6 @@ type DatabaseConnection struct {
   Dbname *string
   Port *int
   Sslmode *string
-}
-
-type LedgerOffsetWrapper struct {
-  Boundary *v1.LedgerOffset_Boundary
-  Absolute *v1.LedgerOffset_Absolute
 }
 
 type ArchivedEventWrapper struct {
@@ -54,6 +52,11 @@ type ExercisedEventWrapper struct {
   Consuming bool
 }
 
+type Retry struct {
+  Count int
+  Limit int
+}
+
 type LedgerContext struct {
   GetConnection func()(ConnectionWrapper)
   GetConnectionWithoutTimeout func()(ConnectionWrapper)
@@ -62,7 +65,9 @@ type LedgerContext struct {
   LedgerId string
   StartPoint string
   DB *gorm.DB
-  DBConnection *DatabaseConnection
+  Retry *Retry
+  ConfigPath string
+  LogLevel string
 }
 
 type ConnectionWrapper struct {
@@ -76,52 +81,23 @@ type ChannelWrapper struct {
   finished chan(bool)
 }
 
-type wrappedStream struct {
-	grpc.ClientStream
-}
-
-func (w *wrappedStream) RecvMsg(m any) error {
-	//logger("Receive a message (Type: %T) at %v", m, time.Now().Format(time.RFC3339))
-	return w.ClientStream.RecvMsg(m)
-}
-
-func (w *wrappedStream) SendMsg(m any) error {
-	//logger("Send a message (Type: %T) at %v", m, time.Now().Format(time.RFC3339))
-	return w.ClientStream.SendMsg(m)
-}
-
-func newWrappedStream(s grpc.ClientStream) grpc.ClientStream {
-	return &wrappedStream{s}
-}
-
-// streamInterceptor is an example stream interceptor.
-func genStreamInterceptor(token string) func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-       nt := fmt.Sprintf("Bearer %s", token)
-       ctx = metadata.AppendToOutgoingContext(ctx, "Authorization", nt)
-	   s, err := streamer(ctx, desc, cc, method, opts...)
-       if err != nil {
-         return nil, err
-       }
-       return newWrappedStream(s), nil
-    }
-}
-
-
-func genUnaryInterceptor(token string) func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-  return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-    nt := fmt.Sprintf("Bearer %s", token)
-    ctx = metadata.AppendToOutgoingContext(ctx, "Authorization", nt)
-	err := invoker(ctx, method, req, reply, cc, opts...)
-	return err
+func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, applicationId *string, startPoint *string, configPath string) (ledgerContext LedgerContext) {
+  var sPoint *string
+  var appId *string
+  if startPoint == nil || *startPoint == "" {
+    sPoint = &Config.GetConfig(configPath).Ledger.StartPoint
+  } else {
+    sPoint = startPoint
   }
-}
-
-func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, applicationId *string, startPoint *string, dbConnection *DatabaseConnection) (ledgerContext LedgerContext) {
+  if applicationId == nil || *applicationId == "nil" {
+    appId = &Config.GetConfig(configPath).Ledger.ApplicationID
+  } else {
+    appId = applicationId
+  }
   return LedgerContext{
       GetConnectionWithoutTimeout: func() (ConnectionWrapper) {
         ctx := context.Background()
-        conn, err := grpc.DialContext(ctx, connStr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(genUnaryInterceptor(*authToken)), grpc.WithStreamInterceptor(genStreamInterceptor(*authToken)))
+        conn, err := grpc.DialContext(ctx, connStr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(GRPCClient.GenTokenUnaryInterceptor(*authToken)), grpc.WithStreamInterceptor(GRPCClient.GenTokenStreamInterceptor(*authToken)))
         if err != nil {
           log.Fatalf("did not connect")
         }
@@ -134,7 +110,7 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
       GetConnection: func() (ConnectionWrapper) {
         ctx := context.Background()
         ctx, cancelCtx := context.WithTimeout(ctx, time.Second * 10)
-        conn, err := grpc.DialContext(ctx, connStr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(genUnaryInterceptor(*authToken)), grpc.WithStreamInterceptor(genStreamInterceptor(*authToken)))
+        conn, err := grpc.DialContext(ctx, connStr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(GRPCClient.GenTokenUnaryInterceptor(*authToken)), grpc.WithStreamInterceptor(GRPCClient.GenTokenStreamInterceptor(*authToken)))
         if err != nil {
           log.Fatalf("did not connect")
         }
@@ -145,11 +121,16 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
         }
       },
       Sandbox: *sandbox,
-      ApplicationId: *applicationId,
+      ApplicationId: *appId,
       LedgerId: "",
-      StartPoint: *startPoint,
-      DBConnection: dbConnection,
+      StartPoint: *sPoint,
+      ConfigPath: configPath,
       DB: nil,
+      LogLevel: Config.GetConfig(configPath).LogLevel,
+      Retry: &Retry {
+        Count: 0,
+        Limit: 10,
+      },
   }
 }
 
@@ -158,12 +139,13 @@ func (ledgerContext *LedgerContext) LogInfo(message string) {
 }
 
 func (ledgerContext *LedgerContext) LogDebug(message string) {
-  log.Printf("\033[0;34m[DEBUG]]\033[0m %s", message)
+  if ledgerContext.LogLevel == "DEBUG" {
+    log.Printf("\033[0;34m[DEBUG]]\033[0m %s", message)
+  }
 }
 
 func (ledgerContext *LedgerContext) LogContract(message string) {
-  enableContractLog := os.Getenv("LOG_CONTRACT")
-  if enableContractLog == "1" {
+  if ledgerContext.LogLevel == "DEBUG" || ledgerContext.LogLevel == "CONTRACT" {
     log.Printf("\033[0;36m[CONTRACT]\033[0m %s", message)
   }
 }
@@ -260,12 +242,15 @@ func (ledgerContext *LedgerContext) GetDatabaseConnection() *gorm.DB {
     return(ledgerContext.DB)
   }
 
+  configs := Config.GetConfig(ledgerContext.ConfigPath)
+
   var db *gorm.DB
-  if ledgerContext.DBConnection != nil {
-    dbCon := ledgerContext.DBConnection
-    db = Database.InitializePostgresDB(*dbCon.Host, *dbCon.User, *dbCon.Password, *dbCon.Dbname, *dbCon.Port, *dbCon.Sslmode)
+  if configs.Ledger.GetPostgres() != nil {
+    x := configs.Ledger.GetPostgres()
+    db = Database.InitializePostgresDB(x.Host, x.User, x.Password, x.Dbname, x.Port, x.Sslmode)
   } else {
-    db = Database.InitializeSQLiteDB()
+    config := configs.Ledger.GetSQLite()
+    db = Database.InitializeSQLiteDB(config.FileName)
   }
   ledgerContext.DB = db
   return(db)
@@ -274,6 +259,8 @@ func (ledgerContext *LedgerContext) GetDatabaseConnection() *gorm.DB {
 func (ledgerContext *LedgerContext) GetStartPoint() *v1.LedgerOffset {
   switch (ledgerContext.StartPoint) {
     case "LEDGER_BEGIN":
+      // We may restart and call this again, make sure to not start from GENESIS twice
+      ledgerContext.StartPoint = "OLDEST"
       return (&v1.LedgerOffset {
         Value: &v1.LedgerOffset_Boundary {
           Boundary: v1.LedgerOffset_LEDGER_BEGIN,
@@ -400,14 +387,19 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
       tMap := make(map[string]any)
       for _, v := range(x.GenMap.Entries) {
         newMap := make(map[string]any)
-        keyVal := ledgerContext.ParseLedgerData(v.Key)
-        keyKind := reflect.TypeOf(keyVal).Kind()
         // Decode the GenMap into a regular Map if our keys are hashable and are not empty
-        if IsHashable(keyKind) && keyVal.(string) != "" {
-          tMap[keyVal.(string)] = ledgerContext.ParseLedgerData(v.Value)
-        } else {
-          newMap["key"] = ledgerContext.ParseLedgerData(v.Key)
-          newMap["value"] = ledgerContext.ParseLedgerData(v.Value)
+        switch val := ledgerContext.ParseLedgerData(v.Key).(type) {
+            case (string):
+              tMap[val] = ledgerContext.ParseLedgerData(v.Value)
+            case (int):
+              tMap[strconv.Itoa(val)] = ledgerContext.ParseLedgerData(v.Value)
+            case (int64):
+              tMap[strconv.Itoa(int(val))] = ledgerContext.ParseLedgerData(v.Value)
+            case (int32):
+              tMap[strconv.Itoa(int(val))] = ledgerContext.ParseLedgerData(v.Value)
+            default:
+              newMap["key"] = ledgerContext.ParseLedgerData(v.Key)
+              newMap["value"] = ledgerContext.ParseLedgerData(v.Value)
         }
 
         if len(newMap) > 0 {
@@ -572,17 +564,21 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
     }
 
     if err != nil {
-      switch err.Error() {
-        case "Aborted":
+      switch status.Code(err) {
+        case codes.Aborted:
+          if ledgerContext.Retry.Limit == ledgerContext.Retry.Count {
+            log.Fatalf("Hit retry limit")
+          }
           ledgerContext.LogInfo(fmt.Sprintf("gRPC connection aborted, error message %s", err))
           ledgerContext.LogInfo("Cleaning up and reattempting connection")
           connection.connection.Close()
           close(dbCommitChannel)
           close(createChannel)
           close(archiveChannel)
+          ledgerContext.Retry.Count = ledgerContext.Retry.Count + 1
           ledgerContext.WatchTransactionStream()
         default:
-          panic(err)
+          log.Fatalf("Got unrecoverable gRPC error %s", err)
       }
     }
   }
@@ -744,11 +740,19 @@ func (ledgerContext *LedgerContext) GetPartiesFromUser() (allParties []string) {
   }
 
   var readAs []string
+  parties := make(map[string]interface {})
   for _, v := range(response.Rights) {
     r := v.GetCanReadAs()
+    a := v.GetCanActAs()
     if r != nil {
-      readAs = append(readAs, r.Party)
+      parties[r.Party] = nil
     }
+    if a != nil {
+      parties[a.Party] = nil
+    }
+  }
+  for k, _ := range(parties) {
+    readAs = append(readAs, k)
   }
   return readAs
 }

@@ -65,8 +65,8 @@ func MigrateTables(db *gorm.DB) () {
   }
 }
 
-func InitializeSQLiteDB() (db *gorm.DB) {
-  db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+func InitializeSQLiteDB(dbName string) (db *gorm.DB) {
+  db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
   if err != nil {
     panic("Failed to open DB")
   }

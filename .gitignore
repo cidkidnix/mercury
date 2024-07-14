@@ -2,3 +2,5 @@ test.db
 pqs
 mercury
 result*
+*.db
+*.json
