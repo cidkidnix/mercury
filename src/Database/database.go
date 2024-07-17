@@ -23,7 +23,7 @@ func (LastOffset) TableName() string {
 type ContractTable struct {
     ContractID string `gorm:"index:contracts_idx_contract_id,unique"`
     ContractKey []byte `gorm:"type:jsonb"`
-    CreateArguments []byte `gorm:"type:jsonb"`
+    CreateArguments []byte `gorm:"type:jsonb;column:payload"`
     TemplateFqn string `gorm:"index:contracts_idx_template_fqn"`
     Witnesses []byte
     Observers []byte
@@ -65,8 +65,13 @@ func MigrateTables(db *gorm.DB) () {
   }
 }
 
-func InitializeSQLiteDB(dbName string) (db *gorm.DB) {
-  db, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+func InitializeSQLiteDB(dbName string, gofast bool) (db *gorm.DB) {
+  var config *gorm.Config
+  config = &gorm.Config{
+    SkipDefaultTransaction: gofast,
+  }
+
+  db, err := gorm.Open(sqlite.Open(dbName), config)
   if err != nil {
     panic("Failed to open DB")
   }
@@ -74,15 +79,22 @@ func InitializeSQLiteDB(dbName string) (db *gorm.DB) {
   return db
 }
 
-func InitializePostgresDB(host string, user string, password string, dbname string, port int, sslmode string) (db *gorm.DB) {
+func InitializePostgresDB(host string, user string, password string, dbname string, port int, sslmode string, gofast bool) (db *gorm.DB) {
   connStr := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=%s", host, user, password, dbname, port, sslmode)
+  var config *gorm.Config
+  config = &gorm.Config{
+    SkipDefaultTransaction: gofast,
+  }
+
   log.Printf("Connecting to PSQL DB %s", dbname)
-  db, err := gorm.Open(postgres.Open(connStr), &gorm.Config{})
+  db, err := gorm.Open(postgres.Open(connStr), config)
   if err != nil {
     panic(fmt.Sprintf("Failed to connect to db, error: %s", err))
   }
   MigrateTables(db)
   db.Exec("CREATE OR REPLACE FUNCTION active() RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM __contracts WHERE contract_id NOT IN (SELECT contract_id FROM __archives); END;")
   db.Exec("CREATE OR REPLACE FUNCTION lookup_contract(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM __contracts WHERE contract_id = n; END;")
+  db.Exec("CREATE OR REPLACE FUNCTION offset_exists(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM __contracts WHERE offset = n; END;")
+  db.Exec("CREATE OR REPLACE FUNCTION partial_template(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM active() WHERE template_fqn LIKE n; END;")
   return db
 }

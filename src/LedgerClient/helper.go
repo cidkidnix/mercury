@@ -85,12 +85,12 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
   var sPoint *string
   var appId *string
   if startPoint == nil || *startPoint == "" {
-    sPoint = &Config.GetConfig(configPath).Ledger.StartPoint
+    sPoint = Config.GetConfig(configPath).Ledger.StartPoint
   } else {
     sPoint = startPoint
   }
   if applicationId == nil || *applicationId == "nil" {
-    appId = &Config.GetConfig(configPath).Ledger.ApplicationID
+    appId = Config.GetConfig(configPath).Ledger.ApplicationID
   } else {
     appId = applicationId
   }
@@ -129,7 +129,7 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
       LogLevel: Config.GetConfig(configPath).LogLevel,
       Retry: &Retry {
         Count: 0,
-        Limit: 10,
+        Limit: Config.GetConfig(configPath).Ledger.GRPCOptions.MaxRetries,
       },
   }
 }
@@ -247,10 +247,10 @@ func (ledgerContext *LedgerContext) GetDatabaseConnection() *gorm.DB {
   var db *gorm.DB
   if configs.Ledger.GetPostgres() != nil {
     x := configs.Ledger.GetPostgres()
-    db = Database.InitializePostgresDB(x.Host, x.User, x.Password, x.Dbname, x.Port, x.Sslmode)
+    db = Database.InitializePostgresDB(x.Host, x.User, x.Password, x.Dbname, x.Port, x.Sslmode, configs.Experimental.IMustGoFast)
   } else {
     config := configs.Ledger.GetSQLite()
-    db = Database.InitializeSQLiteDB(config.FileName)
+    db = Database.InitializeSQLiteDB(config.FileName, configs.Experimental.IMustGoFast)
   }
   ledgerContext.DB = db
   return(db)
@@ -435,6 +435,17 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
   return nil
 }
 
+func (ledgerContext *LedgerContext) RunInGoRoutine(f func()()) {
+  configs := Config.GetConfig(ledgerContext.ConfigPath)
+  if configs.Experimental.DatabaseGoFuncs {
+    go func() {
+      f()
+    }()
+  } else {
+    f()
+  }
+}
+
 func (ledgerContext *LedgerContext) WatchTransactionStream() {
   connection := ledgerContext.GetConnectionWithoutTimeout()
   defer connection.connection.Close()
@@ -443,7 +454,6 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
   ledgerId := ledgerContext.GetLedgerId()
   ledgerContext.LedgerId = ledgerId
   offset := ledgerContext.GetStartPoint()
-
 
   var parties []string
   parties = ledgerContext.GetParties()
@@ -472,17 +482,6 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
   createChannel := make(chan CreateEventWrapper)
   archiveChannel := make(chan ArchivedEventWrapper)
 
-  dbCommitChannel := make(chan func()())
-
-  go func() {
-    for {
-      x, more := <-dbCommitChannel
-      if !more {
-        return
-      }
-      x()
-    }
-  }()
   go func() {
     for {
         select {
@@ -505,10 +504,8 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
             w, _ := json.Marshal(x.Witnesses)
             o, _ := json.Marshal(x.Observers)
             s, _ := json.Marshal(x.Signatories)
-            dbCommitChannel <- func()() {
-                db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID }, Database.CreatesTable { ContractID: x.ContractID })
-            }
-            dbCommitChannel <- func()() {
+            ledgerContext.RunInGoRoutine(func()() {
+              db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID }, Database.CreatesTable { ContractID: x.ContractID })
               db.FirstOrCreate(&Database.ContractTable{
                   CreateArguments: createArgsS,
                   ContractKey: cKeyS,
@@ -519,18 +516,17 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
                   TemplateFqn: fTid,
                   Offset: x.Offset,
               }, Database.ContractTable { ContractID: x.ContractID })
-            }
-            dbCommitChannel <- func()() {
               db.Save(&Database.LastOffset{ Id: 1, Offset: x.Offset })
-            }
+            })
           case y, more := <-archiveChannel:
             if !more {
               return
             }
-            dbCommitChannel <- func()() {
+            ledgerContext.LogContract(fmt.Sprintf("Archive ContractID: %s", y.ContractId))
+            ledgerContext.RunInGoRoutine(func()() {
               db.FirstOrCreate(&Database.ArchivesTable { ContractID: y.ContractId, Offset: y.Offset }, Database.ArchivesTable { ContractID: y.ContractId })
               db.Save(&Database.LastOffset{ Id: 1, Offset: y.Offset })
-            }
+            })
         }
     }
   }()
@@ -572,7 +568,6 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
           ledgerContext.LogInfo(fmt.Sprintf("gRPC connection aborted, error message %s", err))
           ledgerContext.LogInfo("Cleaning up and reattempting connection")
           connection.connection.Close()
-          close(dbCommitChannel)
           close(createChannel)
           close(archiveChannel)
           ledgerContext.Retry.Count = ledgerContext.Retry.Count + 1
@@ -806,7 +801,7 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
         panic("Didn't get offset, bailing")
       } else if err == nil {
         for _, value := range resp.ActiveContracts {
-            log.Printf("Found Contract in ACS: %s", value.ContractId)
+            ledgerContext.LogContract(fmt.Sprintf("ACS Contract: %s", value.ContractId))
             db.FirstOrCreate(&Database.CreatesTable {
               ContractID: value.ContractId,
             }, &Database.CreatesTable { ContractID: value.ContractId })
@@ -835,7 +830,7 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
            }, Database.ContractTable { ContractID: value.ContractId })
         }
         if resp.Offset != "" {
-          log.Printf("Offset: %s", resp.Offset)
+          ledgerContext.LogInfo(fmt.Sprintf("Offset: %s", resp.Offset))
           db.Model(&Database.ContractTable{}).Where("offset = ?", "replaceme").Update("offset", resp.Offset)
           db.Create(&Database.LastOffset{
             Id: 1,

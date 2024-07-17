@@ -29,8 +29,9 @@ func (d *Ledger) GetSQLite() (*SqliteDatabase) {
 
 func (d *Ledger) UnmarshalJSON(data []byte) error {
    var raw struct {
-     StartPoint string `json:"startpoint"`
-     ApplicationID string `json:"applicationid"`
+     StartPoint *string `json:"startpoint"`
+     ApplicationID *string `json:"applicationid"`
+     GRPCOptions *GRPCOptions `json:"grpc"`
      Database json.RawMessage `json:"database"`
    }
 
@@ -54,6 +55,7 @@ func (d *Ledger) UnmarshalJSON(data []byte) error {
        Database: &sqlite,
        StartPoint: raw.StartPoint,
        ApplicationID: raw.ApplicationID,
+       GRPCOptions: raw.GRPCOptions,
     }
     return nil
    }
@@ -63,6 +65,7 @@ func (d *Ledger) UnmarshalJSON(data []byte) error {
          Database: &postgres,
          StartPoint: raw.StartPoint,
          ApplicationID: raw.ApplicationID,
+         GRPCOptions: raw.GRPCOptions,
      }
      return nil
    }
@@ -86,18 +89,29 @@ type SqliteDatabase struct {
 }
 
 type Database struct {
-  Postgres *PostgresDatabase  `json:"postgres,omitempty"`
+  Postgres *PostgresDatabase `json:"postgres,omitempty"`
   Sqlite *SqliteDatabase `json:"sqlite,omitempty"`
+}
+
+type GRPCOptions struct {
+  MaxRetries int `json:"maxretries,omitempty"`
 }
 
 type Ledger struct {
   Database isDatabase_Sum `json:"database"`
-  StartPoint string `json:"startpoint"`
-  ApplicationID string `json:"applicationid"`
+  StartPoint *string `json:"startpoint,omitempty"`
+  ApplicationID *string `json:"applicationid,omitempty"`
+  GRPCOptions *GRPCOptions `json:"grpc,omitempty"`
+}
+
+type Experimental struct {
+  IMustGoFast bool `json:"disable_db_transaction,omitempty"`
+  DatabaseGoFuncs bool `json:"db_multithread,omitempty"`
 }
 
 type Config struct {
   Ledger Ledger `json:"ledger"`
+  Experimental Experimental `json:"experimental,omitempty"`
   LogLevel string `json:"loglevel"`
 }
 
