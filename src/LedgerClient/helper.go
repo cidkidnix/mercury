@@ -856,9 +856,10 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
       } else if err == nil {
         for _, value := range resp.ActiveContracts {
            ledgerContext.LogContract(fmt.Sprintf("ACS Contract: %s", value.ContractId))
-
            transactionTree := ledgerContext.FetchFromTransactionServiceByEventId(value.EventId)
-           for _, event := range(transactionTree.EventsById) {
+           var eIds []string
+           for eventId, event := range(transactionTree.EventsById) {
+             eIds = append(eIds, eventId)
              switch event.Kind.(type) {
                case (*v1.TreeEvent_Created):
                  created := event.GetCreated()
@@ -904,22 +905,26 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
 
            }
            //log.Printf("%s", transactionTree.EventsById)
-           eIds, _ := json.Marshal([]string{value.EventId})
+           ids, _ := json.Marshal(eIds)
 
            db.FirstOrCreate(&Database.TransactionTable {
              TransactionId: transactionTree.TransactionId,
              WorkflowId: transactionTree.WorkflowId,
              CommandId: transactionTree.CommandId,
              Offset: transactionTree.Offset,
-             EventIds: eIds,
+             EventIds: ids,
            })
+           db.FirstOrCreate(&Database.LastOffset{
+             Id: 1,
+             Offset: transactionTree.Offset,
+           }, Database.LastOffset { Id: 1 })
         }
         if resp.Offset != "" {
           ledgerContext.LogInfo(fmt.Sprintf("Offset: %s", resp.Offset))
-          db.Create(&Database.LastOffset{
+          db.FirstOrCreate(&Database.LastOffset{
             Id: 1,
             Offset: resp.Offset,
-          })
+          }, Database.LastOffset { Id: 1 })
           return resp.Offset
         }
       }
