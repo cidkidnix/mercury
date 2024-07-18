@@ -10,7 +10,7 @@ import (
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1"
     "github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1/admin"
     "context"
-    "slices"
+    //"slices"
     "mercury/src/Database"
     "mercury/src/GRPCClient"
     "mercury/src/Config"
@@ -31,9 +31,19 @@ type DatabaseConnection struct {
   Sslmode *string
 }
 
+type TransactionWrapper struct {
+  TransactionId string
+  CommandId string
+  WorkflowId string
+  Offset string
+  EventIds []string
+}
+
 type ArchivedEventWrapper struct {
   ContractId string
-  Offset string
+  EventId string
+  TemplateId *v1.Identifier
+  Witnesses []string
 }
 
 type CreateEventWrapper struct {
@@ -44,7 +54,7 @@ type CreateEventWrapper struct {
   Observers []string
   Signatories []string
   TemplateId *v1.Identifier
-  Offset string
+  EventId string
 }
 
 type ExercisedEventWrapper struct {
@@ -140,7 +150,7 @@ func (ledgerContext *LedgerContext) LogInfo(message string) {
 
 func (ledgerContext *LedgerContext) LogDebug(message string) {
   if ledgerContext.LogLevel == "DEBUG" {
-    log.Printf("\033[0;34m[DEBUG]]\033[0m %s", message)
+    log.Printf("\033[0;34m[DEBUG]\033[0m %s", message)
   }
 }
 
@@ -159,42 +169,42 @@ func IsHashable(kind reflect.Kind) bool {
   }
 }
 
-func (ledgerContext *LedgerContext) TraverseTransactionTreeEvents(parties []string, tree *v1.TransactionTree, ignoreList []string, channel chan CreateEventWrapper, channelExercised chan ExercisedEventWrapper) () {
-   log.Printf("Offset: %s", tree.Offset)
-   log.Printf("TransactionTree Roots: %s", tree.RootEventIds)
-   for _, v := range (tree.EventsById) {
-     data := v.GetCreated()
-     if data == nil {
-        event := v.GetExercised()
-        channelExercised <- ExercisedEventWrapper{
-          ContractID: event.ContractId,
-          Consuming: event.Consuming,
-        }
-        //log.Printf("CHILD EVENT IDS: %s", event.ChildEventIds)
-        for _, e := range (event.ChildEventIds) {
-          log.Printf("Found ExercisedEvent %s", event.EventId)
-          if slices.Contains(ignoreList, event.EventId) {
-            log.Printf("TraverseTransactionTreeEvents: Already Seen %s, Bailing out of recurse", event.EventId)
-          } else {
-            ignoreList := append(ignoreList, event.EventId)
-            tree := ledgerContext.FetchFromTransactionServiceByEventId(e, parties)
-            ledgerContext.TraverseTransactionTreeEvents(parties, tree, ignoreList, channel, channelExercised)
-            log.Printf("Done with traversal for event %s", event.EventId)
-          }
-        }
-      } else {
-        log.Printf("CreatedEvent: %s", data.EventId)
-        channel <- CreateEventWrapper {
-            ContractID: data.ContractId,
-            ContractKey: data.ContractKey,
-            CreateArguments: data.CreateArguments,
-            TemplateId: data.TemplateId,
-            Witnesses: data.WitnessParties,
-            Observers: data.Observers,
-        }
-      }
-   }
-}
+//func (ledgerContext *LedgerContext) TraverseTransactionTreeEvents(parties []string, tree *v1.TransactionTree, ignoreList []string, channel chan CreateEventWrapper, channelExercised chan ExercisedEventWrapper) () {
+//   log.Printf("Offset: %s", tree.Offset)
+//   log.Printf("TransactionTree Roots: %s", tree.RootEventIds)
+//   for _, v := range (tree.EventsById) {
+//     data := v.GetCreated()
+//     if data == nil {
+//        event := v.GetExercised()
+//        channelExercised <- ExercisedEventWrapper{
+//          ContractID: event.ContractId,
+//          Consuming: event.Consuming,
+//        }
+//        //log.Printf("CHILD EVENT IDS: %s", event.ChildEventIds)
+//        for _, e := range (event.ChildEventIds) {
+//          log.Printf("Found ExercisedEvent %s", event.EventId)
+//          if slices.Contains(ignoreList, event.EventId) {
+//            log.Printf("TraverseTransactionTreeEvents: Already Seen %s, Bailing out of recurse", event.EventId)
+//          } else {
+//            ignoreList := append(ignoreList, event.EventId)
+//            tree := ledgerContext.FetchFromTransactionServiceByEventId(e, parties)
+//            ledgerContext.TraverseTransactionTreeEvents(parties, tree, ignoreList, channel, channelExercised)
+//            log.Printf("Done with traversal for event %s", event.EventId)
+//          }
+//        }
+//      } else {
+//        log.Printf("CreatedEvent: %s", data.EventId)
+//        channel <- CreateEventWrapper {
+//            ContractID: data.ContractId,
+//            ContractKey: data.ContractKey,
+//            CreateArguments: data.CreateArguments,
+//            TemplateId: data.TemplateId,
+//            Witnesses: data.WitnessParties,
+//            Observers: data.Observers,
+//        }
+//      }
+//   }
+//}
 
 func (ledgerContext *LedgerContext) FetchFromTransactionServiceById(transactionId string, parties []string) (transaction *v1.TransactionTree) {
   connection := ledgerContext.GetConnection()
@@ -217,11 +227,12 @@ func (ledgerContext *LedgerContext) FetchFromTransactionServiceById(transactionI
 
 }
 
-func (ledgerContext *LedgerContext) FetchFromTransactionServiceByEventId(eventId string, parties []string) (transaction *v1.TransactionTree) {
+func (ledgerContext *LedgerContext) FetchFromTransactionServiceByEventId(eventId string) (transaction *v1.TransactionTree) {
   connection := ledgerContext.GetConnection()
   defer connection.connection.Close()
   defer connection.cancelCtx()
 
+  parties := ledgerContext.GetParties()
   client := v1.NewTransactionServiceClient(connection.connection)
   ledgerId := ledgerContext.GetLedgerId()
   response, err := client.GetTransactionByEventId(*connection.ctx, &v1.GetTransactionByEventIdRequest{
@@ -481,10 +492,27 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
 
   createChannel := make(chan CreateEventWrapper)
   archiveChannel := make(chan ArchivedEventWrapper)
+  transactionChannel := make(chan TransactionWrapper)
 
   go func() {
     for {
         select {
+          case t, more := <-transactionChannel:
+            if !more {
+              return
+            }
+            ledgerContext.LogDebug(fmt.Sprintf("Got Transaction: %s", t.TransactionId))
+            eIds, _ := json.Marshal(t.EventIds)
+            ledgerContext.RunInGoRoutine(func()() {
+              db.FirstOrCreate(&Database.TransactionTable {
+                TransactionId: t.TransactionId,
+                WorkflowId: t.WorkflowId,
+                CommandId: t.CommandId,
+                Offset: t.Offset,
+                EventIds: eIds,
+              }, Database.TransactionTable { TransactionId: t.TransactionId })
+            })
+            db.Save(&Database.LastOffset{ Id: 1, Offset: t.Offset })
           case x, more := <-createChannel:
             if !more {
               return
@@ -505,27 +533,42 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
             o, _ := json.Marshal(x.Observers)
             s, _ := json.Marshal(x.Signatories)
             ledgerContext.RunInGoRoutine(func()() {
-              db.FirstOrCreate(&Database.CreatesTable{ ContractID: x.ContractID }, Database.CreatesTable { ContractID: x.ContractID })
-              db.FirstOrCreate(&Database.ContractTable{
-                  CreateArguments: createArgsS,
-                  ContractKey: cKeyS,
+              db.FirstOrCreate(&Database.CreatesTable{
                   ContractID: x.ContractID,
+                  ContractKey: cKeyS,
+                  CreateArguments: createArgsS,
                   Observers: o,
                   Witnesses: w,
                   Signatories: s,
                   TemplateFqn: fTid,
-                  Offset: x.Offset,
-              }, Database.ContractTable { ContractID: x.ContractID })
-              db.Save(&Database.LastOffset{ Id: 1, Offset: x.Offset })
+                  EventId: x.EventId,
+              }, Database.CreatesTable { ContractID: x.ContractID })
+              //db.FirstOrCreate(&Database.ContractTable{
+              //    CreateArguments: createArgsS,
+              //    ContractKey: cKeyS,
+              //    ContractID: x.ContractID,
+              //    Observers: o,
+              //    Witnesses: w,
+              //    Signatories: s,
+              //    TemplateFqn: fTid,
+              //    Offset: x.Offset,
+              //}, Database.ContractTable { ContractID: x.ContractID })
             })
           case y, more := <-archiveChannel:
             if !more {
               return
             }
             ledgerContext.LogContract(fmt.Sprintf("Archive ContractID: %s", y.ContractId))
+            tid := y.TemplateId
+            fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
+            w, _ := json.Marshal(y.Witnesses)
             ledgerContext.RunInGoRoutine(func()() {
-              db.FirstOrCreate(&Database.ArchivesTable { ContractID: y.ContractId, Offset: y.Offset }, Database.ArchivesTable { ContractID: y.ContractId })
-              db.Save(&Database.LastOffset{ Id: 1, Offset: y.Offset })
+              db.FirstOrCreate(&Database.ArchivesTable {
+                  ContractID: y.ContractId,
+                  EventId: y.EventId,
+                  TemplateFqn: fTid,
+                  Witnesses: w,
+              }, Database.ArchivesTable { ContractID: y.ContractId })
             })
         }
     }
@@ -534,6 +577,7 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
     resp, err := response.Recv()
     if err == nil {
       for _, value := range resp.Transactions {
+        var eIds []string
         for _, data := range value.Events {
           created := data.GetCreated()
           if created != nil {
@@ -545,16 +589,26 @@ func (ledgerContext *LedgerContext) WatchTransactionStream() {
                 Witnesses: created.WitnessParties,
                 Observers: created.Observers,
                 Signatories: created.Signatories,
-                Offset: value.Offset,
+                EventId: created.EventId,
             }
-
+            eIds = append(eIds, created.EventId)
           } else {
             archived := data.GetArchived()
             archiveChannel <- ArchivedEventWrapper {
               ContractId: archived.ContractId,
-              Offset: value.Offset,
+              EventId: archived.EventId,
+              TemplateId: archived.TemplateId,
+              Witnesses: archived.WitnessParties,
             }
+            eIds = append(eIds, archived.EventId)
           }
+        }
+        transactionChannel <- TransactionWrapper {
+          TransactionId: value.TransactionId,
+          CommandId: value.CommandId,
+          WorkflowId: value.WorkflowId,
+          Offset: value.Offset,
+          EventIds: eIds,
         }
       }
     }
@@ -801,37 +855,67 @@ func (ledgerContext *LedgerContext) GetActiveContractSet() (string) {
         panic("Didn't get offset, bailing")
       } else if err == nil {
         for _, value := range resp.ActiveContracts {
-            ledgerContext.LogContract(fmt.Sprintf("ACS Contract: %s", value.ContractId))
-            db.FirstOrCreate(&Database.CreatesTable {
-              ContractID: value.ContractId,
-            }, &Database.CreatesTable { ContractID: value.ContractId })
-            cKey := ledgerContext.ParseLedgerData(value.ContractKey)
-            cKeyS, _ := json.Marshal(cKey)
-            createArgs := ledgerContext.ParseLedgerData(&v1.Value {
-              Sum: &v1.Value_Record {
-                Record: value.CreateArguments,
-              },
-            })
-            createArgsS, _ := json.Marshal(createArgs)
-            tid := value.TemplateId
-            fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
-            w, _ := json.Marshal(value.WitnessParties)
-            o, _ := json.Marshal(value.Observers)
-            s, _ := json.Marshal(value.Signatories)
-            db.FirstOrCreate(&Database.ContractTable {
-              CreateArguments: createArgsS,
-              ContractKey: cKeyS,
-              ContractID: value.ContractId,
-              Observers: o,
-              Witnesses: w,
-              Signatories: s,
-              TemplateFqn: fTid,
-              Offset: "replaceme", // We don't know the offset at this point in time until after the fact, we replace this later
-           }, Database.ContractTable { ContractID: value.ContractId })
+           ledgerContext.LogContract(fmt.Sprintf("ACS Contract: %s", value.ContractId))
+
+           transactionTree := ledgerContext.FetchFromTransactionServiceByEventId(value.EventId)
+           for _, event := range(transactionTree.EventsById) {
+             switch event.Kind.(type) {
+               case (*v1.TreeEvent_Created):
+                 created := event.GetCreated()
+                 cKey := ledgerContext.ParseLedgerData(created.ContractKey)
+                 cKeyS, _ := json.Marshal(cKey)
+                 createArgs := ledgerContext.ParseLedgerData(&v1.Value {
+                   Sum: &v1.Value_Record {
+                     Record: created.CreateArguments,
+                   },
+                 })
+                 createArgsS, _ := json.Marshal(createArgs)
+                 tid := created.TemplateId
+                 fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
+                 w, _ := json.Marshal(created.WitnessParties)
+                 o, _ := json.Marshal(created.Observers)
+                 s, _ := json.Marshal(created.Signatories)
+                 db.FirstOrCreate(&Database.CreatesTable {
+                   CreateArguments: createArgsS,
+                   ContractKey: cKeyS,
+                   ContractID: created.ContractId,
+                   Observers: o,
+                   Witnesses: w,
+                   Signatories: s,
+                   TemplateFqn: fTid,
+                   EventId: created.EventId,
+                 }, Database.CreatesTable { ContractID: created.ContractId })
+               case (*v1.TreeEvent_Exercised):
+                 exercised := event.GetExercised()
+                 tid := exercised.TemplateId
+                 fTid := fmt.Sprintf("%s:%s:%s", tid.PackageId, tid.ModuleName, tid.EntityName)
+                 w, _ := json.Marshal(exercised.WitnessParties)
+                 if exercised.Choice == "Archive" {
+                   db.FirstOrCreate(&Database.ArchivesTable {
+                      ContractID: exercised.ContractId,
+                      EventId: exercised.EventId,
+                      TemplateFqn: fTid,
+                      Witnesses: w,
+                   }, Database.ArchivesTable { ContractID: exercised.ContractId })
+                 } else {
+                   ledgerContext.LogDebug(fmt.Sprintf("Event %s is not an archive, skipping", exercised.EventId))
+                 }
+             }
+
+           }
+           //log.Printf("%s", transactionTree.EventsById)
+           eIds, _ := json.Marshal([]string{value.EventId})
+
+           db.FirstOrCreate(&Database.TransactionTable {
+             TransactionId: transactionTree.TransactionId,
+             WorkflowId: transactionTree.WorkflowId,
+             CommandId: transactionTree.CommandId,
+             Offset: transactionTree.Offset,
+             EventIds: eIds,
+           })
         }
         if resp.Offset != "" {
           ledgerContext.LogInfo(fmt.Sprintf("Offset: %s", resp.Offset))
-          db.Model(&Database.ContractTable{}).Where("offset = ?", "replaceme").Update("offset", resp.Offset)
           db.Create(&Database.LastOffset{
             Id: 1,
             Offset: resp.Offset,
