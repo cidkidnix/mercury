@@ -4,3 +4,4 @@ mercury
 result*
 *.db
 *.json
+postgres
