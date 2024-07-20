@@ -6,6 +6,8 @@ import (
   "gorm.io/driver/postgres"
   "fmt"
   "log"
+  pq "github.com/lib/pq"
+  "time"
   //"gorm.io/gorm/logger"
   //"github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1"
 )
@@ -14,6 +16,7 @@ import (
 type Offsets struct {
     OffsetIx uint64 `gorm:"index:offset_offsets_idx_int,unique"`
     Offset string `gorm:"index:offset_offsets_idx,unique"`
+    EffectiveAt time.Time `gorm:"type:timestamp with time zone"`
     TransactionId string `grom:"index:offset_offsets_transaction_idx,unique"`
 }
 
@@ -37,10 +40,10 @@ type ExercisedTable struct {
   TemplateFqn string `gorm:"index:exercised_event_template_idx"`
   Choice string `gorm:"index:exercised_event_choice_idx"`
   ChoiceArgument []byte `gorm:"type:jsonb"`
-  ActingParties []byte `gorm:"type:jsonb"`
+  ActingParties pq.StringArray `gorm:"type:text[]"`
   Consuming bool `gorm:"exercised_event_consuming"`
-  ChildEventIds []byte `gorm:"type:jsonb"`
-  Witnesses []byte `gorm:"type:jsonb"`
+  ChildEventIds pq.StringArray `gorm:"type:text[]"`
+  Witnesses pq.StringArray `gorm:"type:text[]"`
   ExerciseResult []byte `gorm:"type:jsonb"`
 }
 
@@ -53,7 +56,7 @@ type TransactionTable struct {
   WorkflowId string
   CommandId string `gorm:"index_transactions_idx_command_id"`
   Offset string `gorm:"index:transactions_idx_offset,unique"` // offsets are unique
-  EventIds []byte `gorm:"type:jsonb"`
+  EventIds pq.StringArray `gorm:"type:text[]"`
 }
 
 func (TransactionTable) TableName() string {
@@ -64,7 +67,7 @@ type ArchivesTable struct {
     ContractID string `gorm:"index:archives_idx_contract_id,unique"`
     EventId string `gorm:"index:archives_event_idx,unique;column:event_id"`
     TemplateFqn string `gorm:"index:archives_template_fqn_idx"`
-    Witnesses []byte `gorm:"type:jsonb"`
+    Witnesses pq.StringArray `gorm:"type:text[]"`
 }
 
 func (ArchivesTable) TableName() string {
@@ -76,9 +79,9 @@ type CreatesTable struct {
    ContractKey []byte `gorm:"type:jsonb"`
    CreateArguments []byte `gorm:"type:jsonb;column:payload"`
    TemplateFqn string `gorm:"index:contracts_idx_template_fqn"`
-   Witnesses []byte `gorm:"type:jsonb"`
-   Observers []byte `gorm:"type:jsonb"`
-   Signatories []byte `gorm:"type:jsonb"`
+   Witnesses pq.StringArray `gorm:"type:text[]"`
+   Observers pq.StringArray `gorm:"type:text[]"`
+   Signatories pq.StringArray `gorm:"type:text[]"`
    EventId string `gorm:"index:creates_event_id,unique;column:event_id`
 }
 
@@ -133,7 +136,7 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
   MigrateTables(db)
   db.Exec(`
     CREATE OR REPLACE FUNCTION active(template_id text default null, offset_end text default null)
-      RETURNS TABLE(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses jsonb, observers jsonb, signatories jsonb, event_id text, transaction_id text, "offset_ix" bigint)
+      RETURNS TABLE(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses text[], observers text[], signatories text[], event_id text, transaction_id text, "offset_ix" bigint)
       LANGUAGE plpgsql VOLATILE
       AS $BODY$
         BEGIN
@@ -159,24 +162,51 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
   `)
   db.Exec(`
     CREATE OR REPLACE FUNCTION lookup_contract(contract text)
-      RETURNS table(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses jsonb, observers jsonb, signatories jsonb, event_id text, transaction_id text)
+      RETURNS table(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses text[], observers text[], signatories text[], event_id text, transaction_id text)
       BEGIN ATOMIC
-       SELECT __creates.*, transaction_id FROM __transactions AS t INNER JOIN __creates ON t.event_ids ? __creates.event_id WHERE contract_id = contract;
+       SELECT __creates.*, transaction_id FROM __transactions AS t INNER JOIN __creates ON __creates.event_id = ANY(t.event_ids);
       END;
   `)
   db.Exec(`
     CREATE OR REPLACE FUNCTION offset_exists(n text)
       RETURNS table(ledger_offset text)
       BEGIN ATOMIC
-        select __transactions.offset FROM __transactions WHERE __transactions.offset = n;
+        select __transactions."offset" FROM __transactions WHERE __transactions."offset" = n;
       END;
   `)
   db.Exec(`
-    CREATE INDEX IF NOT EXISTS event_ids_jsonb ON __transactions USING gin(event_ids);
+    CREATE OR REPLACE FUNCTION latest_offset()
+      RETURNS text
+      BEGIN ATOMIC
+        select __offsets."offset" from __offsets ORDER BY offset_ix DESC LIMIT 1;
+      END;
   `)
   db.Exec(`
-    CREATE INDEX IF NOT EXISTS payload_creates ON __creates USING gin(payload);
+    CREATE OR REPLACE FUNCTION nearest_offset(n timestamptz)
+      RETURNS text
+      LANGUAGE plpgsql
+      AS $func$
+        DECLARE
+          t text;
+        BEGIN
+          SELECT __offsets."offset" INTO t FROM __offsets WHERE effective_at <= n ORDER BY effective_at DESC LIMIT 1;
+
+          IF COUNT(t) = 0 THEN
+            RETURN NULL;
+          ELSE
+            RETURN t;
+          END IF;
+        END;
+      $func$
+
+
   `)
+  //db.Exec(`
+  //  CREATE INDEX IF NOT EXISTS event_ids_jsonb ON __transactions USING gin(event_ids);
+  //`)
+  //db.Exec(`
+  //  CREATE INDEX IF NOT EXISTS payload_creates ON __creates USING gin(payload);
+  //`)
   //db.Exec("CREATE OR REPLACE FUNCTION lookup_contract(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM __contracts WHERE contract_id = n; END;")
   //db.Exec("CREATE OR REPLACE FUNCTION offset_exists(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM __contracts WHERE offset = n; END;")
   //db.Exec("CREATE OR REPLACE FUNCTION partial_template(n text) RETURNS SETOF public.__contracts BEGIN ATOMIC SELECT * FROM active() WHERE template_fqn LIKE n; END;")
