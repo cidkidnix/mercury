@@ -4,5 +4,5 @@ in pkgs.buildGoModule {
   name = "mercury";
   src = builtins.fetchGit ./.;
 
-  vendorHash = "sha256-fJIy8TgtdxB9pA12dTnj96B6N/dkptRcpsHyF9sxWP4=";
+  vendorHash = "sha256-wJOAzeBCDJrSJWhhCrouSgAo+T8KQVNbOPcj0j2Kpu0=";
 }
