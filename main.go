@@ -19,6 +19,5 @@ func main() {
 
   connectionVal := *connectionStr
   ledgerClient := LedgerClient.IntializeGRPCConnection(connectionVal, token, sandbox, applicationId, startPoint, *configPath)
-  ledgerClient.WatchTransactionStream()
-  ledgerClient.GetActiveContractSet()
+  ledgerClient.WatchTransactionTreeStream()
 }

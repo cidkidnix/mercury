@@ -81,7 +81,7 @@ type PostgresDatabase struct {
   Port int `json:"port,omitempty"`
   Password string `json:"password,omitempty"`
   Dbname string `json:"database,omitempty"`
-  Sslmode string `json:"sslmod,omitempty"`
+  Sslmode string `json:"sslmode,omitempty"`
 }
 
 type SqliteDatabase struct {
