@@ -168,11 +168,20 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
       END;
   `)
   db.Exec(`
-    CREATE OR REPLACE FUNCTION offset_exists(n text)
-      RETURNS table(ledger_offset text)
-      BEGIN ATOMIC
-        select __transactions."offset" FROM __transactions WHERE __transactions."offset" = n;
-      END;
+    CREATE OR REPLACE FUNCTION validate_offset_exists(n text)
+      RETURNS text
+      LANGUAGE plpgsql VOLATILE
+      AS $$
+        DECLARE offset_new TEXT;
+        BEGIN
+          select __transactions."offset" FROM __transactions WHERE __transactions."offset" = n LIMIT 1 INTO offset_new;
+          IF offset_new IS NULL THEN
+            RAISE EXCEPTION 'Illegal offset %', n;
+          ELSE
+            RETURN offset_new;
+          END IF;
+        END;
+      $$
   `)
   db.Exec(`
     CREATE OR REPLACE FUNCTION latest_offset()

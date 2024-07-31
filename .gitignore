@@ -3,5 +3,5 @@ pqs
 mercury
 result*
 *.db
-*.json
+config*.json
 postgres

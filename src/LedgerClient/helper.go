@@ -22,7 +22,6 @@ import (
     "strconv"
 )
 
-
 type DatabaseConnection struct {
   Host *string
   User *string
