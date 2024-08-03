@@ -154,14 +154,20 @@ func IntializeGRPCConnection(connStr string, authToken *string, sandbox *bool, a
 }
 
 func (ledgerContext *LedgerContext) LogTime(name string, f func()()) {
-  initial := time.Now()
-  f()
-  end := time.Since(initial)
-  log.Printf(fmt.Sprintf("\033[0;36m[TIME]\033[0m %v: Time to complete %v", name, end))
+  if ledgerContext.LogLevel == "DEBUG" || ledgerContext.LogLevel == "TIME" && ledgerContext.LogLevel != "SILENT" {
+    initial := time.Now()
+    f()
+    end := time.Since(initial)
+    log.Printf(fmt.Sprintf("\033[0;36m[TIME]\033[0m %v: Time to complete %v", name, end))
+  } else {
+    f()
+  }
 }
 
 func (ledgerContext *LedgerContext) LogInfo(message string) {
-  log.Printf("\033[0;35m[INFO]\033[0m %s", message)
+  if ledgerContext.LogLevel != "SILENT" {
+    log.Printf("\033[0;35m[INFO]\033[0m %s", message)
+  }
 }
 
 func (ledgerContext *LedgerContext) LogDebug(message string) {
@@ -379,7 +385,7 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
     case (*v1.Value_Text):
       return x.Text
     case (*v1.Value_List):
-      emptyMap := make(map[string]any)
+      emptyList := []string{}
       if x.List.Elements != nil {
         var lMap [](any)
         for _, v := range(x.List.Elements) {
@@ -387,19 +393,18 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
         }
         return lMap
       } else {
-        return emptyMap
+        return emptyList
       }
     case (*v1.Value_Date):
       return x.Date
     case (*v1.Value_Optional):
-      newMap := make(map[string]any)
-      emptyMap := make(map[string]any)
+      emptyMap := make(map[string]string)
       if x.Optional.GetValue() != nil {
-        newMap["Some"] = ledgerContext.ParseLedgerData(x.Optional.Value)
+        return ledgerContext.ParseLedgerData(x.Optional.Value)
       } else {
-        newMap["None"] = emptyMap
+        return emptyMap
       }
-      return newMap
+
     case (*v1.Value_Int64):
       return x.Int64
     case (*v1.Value_Numeric):
@@ -571,7 +576,6 @@ func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
                   fmt.Printf("%s", t.Offset)
                   panic("Failed to decode offset into integer")
                 }
-                log.Printf("%s", t.EffectiveAt)
                 db.Create(&Database.Offsets {
                   OffsetIx: ixOffset,
                   Offset: t.Offset,

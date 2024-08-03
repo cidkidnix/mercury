@@ -3,10 +3,12 @@ let
   packageImport = args:
     import ./dep/nixpkgs/default.nix args;
 
-  makePackage = { pkgs }: pkgs.buildGoModule {
+  makePackage = { pkgs, static ? false }: pkgs.buildGoModule {
     name = "mercury";
     src = builtins.fetchGit ./.;
 
+
+    CGO_ENABLED = if static then 0 else 1;
     vendorHash = "sha256-wJOAzeBCDJrSJWhhCrouSgAo+T8KQVNbOPcj0j2Kpu0=";
 
     meta = with lib; {
@@ -16,8 +18,38 @@ let
     };
   };
 
+
+  makeDockerImage = { pkgs }: pkgs.dockerTools.buildImage {
+    name = "mercury";
+    config = {
+      Cmd = [ "${makePackage { inherit pkgs; }}/bin/mercury" ];
+    };
+  };
+
 in {
   linux = {
+    docker = {
+      amd64 = makeDockerImage {
+        pkgs = packageImport { system = "x86_64-linux"; };
+      };
+      aarch64 = makeDockerImage {
+        pkgs = packageImport { system = "aarch64-linux"; };
+      };
+    };
+    static = {
+      amd64 = makePackage {
+        static = true;
+        pkgs = packageImport {
+          system = "x86_64-linux";
+        };
+      };
+      aarch64 = makePackage {
+        static = true;
+        pkgs = packageImport {
+          system = "aarch64-linux";
+        };
+      };
+    };
     amd64 = makePackage {
       pkgs = packageImport {
         system = "x86_64-linux";

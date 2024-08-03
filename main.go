@@ -2,6 +2,7 @@ package main
 
 import (
     "mercury/src/LedgerClient"
+    repl "mercury/src/Repl"
     "log"
     "flag"
 )
@@ -15,9 +16,15 @@ func main() {
   startPoint := flag.String("start-point", "", "Where to start the PQS at")
   configPath := flag.String("config", "./config.json", "What config to load")
 
+  replMode := flag.Bool("repl-mode", false, "Start mercury in repl mode")
+
   flag.Parse()
 
-  connectionVal := *connectionStr
-  ledgerClient := LedgerClient.IntializeGRPCConnection(connectionVal, token, sandbox, applicationId, startPoint, *configPath)
-  ledgerClient.WatchTransactionTreeStream()
+  if *replMode {
+    repl.Repl()
+  } else {
+    connectionVal := *connectionStr
+    ledgerClient := LedgerClient.IntializeGRPCConnection(connectionVal, token, sandbox, applicationId, startPoint, *configPath)
+    ledgerClient.WatchTransactionTreeStream()
+  }
 }

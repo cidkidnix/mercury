@@ -8,7 +8,7 @@ import (
   "log"
   pq "github.com/lib/pq"
   "time"
-  //"gorm.io/gorm/logger"
+  "gorm.io/gorm/logger"
   //"github.com/digital-asset/dazl-client/v7/go/api/com/daml/ledger/api/v1"
 )
 
@@ -111,6 +111,7 @@ func InitializeSQLiteDB(dbName string, gofast bool) (db *gorm.DB) {
   var config *gorm.Config
   config = &gorm.Config{
     SkipDefaultTransaction: gofast,
+    Logger: logger.Default.LogMode(logger.Silent),
   }
 
   db, err := gorm.Open(sqlite.Open(dbName), config)
@@ -162,9 +163,13 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
   `)
   db.Exec(`
     CREATE OR REPLACE FUNCTION lookup_contract(contract text)
-      RETURNS table(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses text[], observers text[], signatories text[], event_id text, transaction_id text)
+      RETURNS table(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses text[], observers text[], signatories text[], event_id text, transaction_id text, offset_ix bigint)
       BEGIN ATOMIC
-       SELECT __creates.*, transaction_id FROM __transactions AS t INNER JOIN __creates ON __creates.event_id = ANY(t.event_ids);
+      SELECT __creates.*, __transactions.transaction_id, offset_ix
+        FROM __creates
+          INNER JOIN __transactions ON __transactions.event_ids @> ARRAY[__creates.event_id]
+          INNER JOIN __offsets ON __offsets."offset" = __transactions."offset"
+        WHERE contract_id = contract;
       END;
   `)
   db.Exec(`
