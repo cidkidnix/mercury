@@ -104,14 +104,22 @@ type Ledger struct {
   GRPCOptions *GRPCOptions `json:"grpc,omitempty"`
 }
 
+type MultiThreadListen struct {
+  Count int `json:"count"`
+}
+
 type Experimental struct {
   IMustGoFast bool `json:"disable_db_transaction,omitempty"`
   DatabaseGoFuncs bool `json:"db_multithread,omitempty"`
+  MultiThreadListen *MultiThreadListen `json:"canton_multithread_stream,omitempty"`
 }
 
 type Config struct {
   Ledger Ledger `json:"ledger"`
   Experimental Experimental `json:"experimental,omitempty"`
+  MaxWorkers int `json:"max_workers"`
+  MaxDBConnections int `json:"max_db_conns"`
+  IdleDBConnections int `json:"max_db_conns"`
   LogLevel string `json:"loglevel"`
 }
 

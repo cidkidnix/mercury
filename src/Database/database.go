@@ -127,6 +127,7 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
   var config *gorm.Config
   config = &gorm.Config{
     SkipDefaultTransaction: gofast,
+    Logger: logger.Default.LogMode(logger.Silent),
   }
 
   log.Printf("Connecting to PSQL DB %s", dbname)

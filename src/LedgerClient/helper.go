@@ -396,7 +396,9 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
         return emptyList
       }
     case (*v1.Value_Date):
-      return x.Date
+      epoch := time.Unix(0, 0).UTC()
+      timestamp := epoch.AddDate(0, 0, int(x.Date)).UTC().Format(time.RFC3339)
+      return fmt.Sprintf("%s", timestamp)
     case (*v1.Value_Optional):
       emptyMap := make(map[string]string)
       if x.Optional.GetValue() != nil {
@@ -410,7 +412,8 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
     case (*v1.Value_Numeric):
       return x.Numeric
     case (*v1.Value_Timestamp):
-      return x.Timestamp
+      timestamp := time.UnixMicro(x.Timestamp).UTC().Format(time.RFC3339)
+      return fmt.Sprintf("%s", timestamp)
     case (*v1.Value_Bool):
       return x.Bool
     case (*v1.Value_ContractId):
@@ -422,38 +425,14 @@ func (ledgerContext *LedgerContext) ParseLedgerData(value *v1.Value) (any) {
       }
       return newMap
     case (*v1.Value_GenMap):
-      var mapList [](map[string]any)
-      tMap := make(map[string]any)
+      mapList := [][]any{}
       for _, v := range(x.GenMap.Entries) {
-        newMap := make(map[string]any)
-        // Decode the GenMap into a regular Map if our keys are hashable and are not empty
-        switch val := ledgerContext.ParseLedgerData(v.Key).(type) {
-            case (string):
-              tMap[val] = ledgerContext.ParseLedgerData(v.Value)
-            case (int):
-              tMap[strconv.Itoa(val)] = ledgerContext.ParseLedgerData(v.Value)
-            case (int64):
-              tMap[strconv.Itoa(int(val))] = ledgerContext.ParseLedgerData(v.Value)
-            case (int32):
-              tMap[strconv.Itoa(int(val))] = ledgerContext.ParseLedgerData(v.Value)
-            default:
-              newMap["key"] = ledgerContext.ParseLedgerData(v.Key)
-              newMap["value"] = ledgerContext.ParseLedgerData(v.Value)
-        }
-
-        if len(newMap) > 0 {
-          mapList = append(mapList, newMap)
-        }
+        var inner []any
+        inner = append(inner, ledgerContext.ParseLedgerData(v.Key))
+        inner = append(inner, ledgerContext.ParseLedgerData(v.Value))
+        mapList = append(mapList, inner)
       }
-      // Make sure we append the correct bits into the list (if applicable)
-      if (len(mapList) > 0) {
-        if (len(tMap) > 0) {
-          mapList = append(mapList, tMap)
-        }
-        return mapList
-      } else {
-        return tMap
-      }
+      return mapList
 
     case (*v1.Value_Variant):
       newMap := make(map[string]any)
@@ -494,8 +473,8 @@ func (ledgerContext *LedgerContext) worker(id int,  jobs <- chan(func()())) {
 }
 
 func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
-  connection := ledgerContext.GetConnectionWithoutTimeout()
-  defer connection.connection.Close()
+  inFlightTransaction := make(map[string]interface{})
+  locked := false
 
   db := ledgerContext.GetDatabaseConnection()
   ledgerId := ledgerContext.GetLedgerId()
@@ -512,20 +491,7 @@ func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
   pipelineParties,  _ := json.Marshal(parties)
   ledgerContext.LogInfo(fmt.Sprintf("Staring pipeline on behalf of Parties: %v", string(pipelineParties)))
 
-  client := v1.NewTransactionServiceClient(connection.connection)
-
-  response, err := client.GetTransactionTrees(*connection.ctx, &v1.GetTransactionsRequest {
-    LedgerId: ledgerId,
-    Filter: &v1.TransactionFilter {
-      FiltersByParty: partyMap,
-    },
-    Begin: offset,
-    Verbose: true,
-  })
-
-  if err != nil {
-    panic(err)
-  }
+  numWorkers := Config.GetConfig(ledgerContext.ConfigPath).MaxWorkers
 
   exercisedChannel := make(chan ExercisedEventWrapper)
   createChannel := make(chan CreateEventWrapper)
@@ -533,7 +499,7 @@ func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
 
   workerConnection := make(chan func()())
 
-  for w := 0; w <= 30; w++ {
+  for w := 0; w <= numWorkers; w++ {
     go ledgerContext.worker(w, workerConnection)
   }
 
@@ -584,6 +550,12 @@ func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
                 })
               }
             })
+            for (locked == true) {
+              ledgerContext.LogInfo("Waiting for lock to remove transaction")
+            }
+            locked = true
+            delete(inFlightTransaction, t.TransactionId)
+            locked = false
           case x, more := <-createChannel:
             if !more {
               return
@@ -655,71 +627,138 @@ func (ledgerContext *LedgerContext) WatchTransactionTreeStream() {
     }
   }()
 
-  for {
-    resp, err := response.Recv()
-    if err == nil {
-      for _, value := range resp.Transactions {
-        var eIds []string
-        for eventId, data := range value.EventsById {
-          created := data.GetCreated()
-          if created != nil {
-            createChannel <- CreateEventWrapper {
-                ContractID: created.ContractId,
-                ContractKey: created.ContractKey,
-                CreateArguments: created.CreateArguments,
-                TemplateId: created.TemplateId,
-                Witnesses: created.WitnessParties,
-                Observers: created.Observers,
-                Signatories: created.Signatories,
-                EventId: created.EventId,
-            }
-            eIds = append(eIds, eventId)
-          } else {
-            exercised := data.GetExercised()
-            exercisedChannel <- ExercisedEventWrapper {
-              EventId: exercised.EventId,
-              ContractID: exercised.ContractId,
-              TemplateId: exercised.TemplateId,
-              Choice: exercised.Choice,
-              ChoiceArgument: exercised.ChoiceArgument,
-              ActingParties: exercised.ActingParties,
-              Consuming: exercised.Consuming,
-              Witnesses: exercised.WitnessParties,
-              ChildEventIds: exercised.ChildEventIds,
-              ExerciseResult: exercised.ExerciseResult,
-            }
-            eIds = append(eIds, eventId)
-          }
-        }
-        transactionChannel <- TransactionWrapper {
-          TransactionId: value.TransactionId,
-          CommandId: value.CommandId,
-          WorkflowId: value.WorkflowId,
-          Offset: value.Offset,
-          EffectiveAt: value.EffectiveAt.AsTime(),
-          EventIds: eIds,
-        }
-      }
-    }
 
-    if err != nil {
-      switch status.Code(err) {
-        case codes.Aborted:
-          if ledgerContext.Retry.Limit == ledgerContext.Retry.Count {
-            log.Fatalf("Hit retry limit")
-          }
-          ledgerContext.LogInfo(fmt.Sprintf("gRPC connection aborted, error message %s", err))
-          ledgerContext.LogInfo("Cleaning up and reattempting connection")
-          connection.connection.Close()
-          close(createChannel)
-          close(exercisedChannel)
-          close(workerConnection)
-          ledgerContext.Retry.Count = ledgerContext.Retry.Count + 1
-          ledgerContext.WatchTransactionStream()
-        default:
-          log.Fatalf("Got unrecoverable gRPC error %s", err)
+
+  val := Config.GetConfig(ledgerContext.ConfigPath).Experimental.MultiThreadListen
+  var amountOfThreads int
+  if val != nil {
+    amountOfThreads = val.Count
+  } else {
+    amountOfThreads = 1
+  }
+
+  for i := 0; i < amountOfThreads; i++ {
+    go func()() {
+      connection := ledgerContext.GetConnectionWithoutTimeout()
+      defer connection.connection.Close()
+      client := v1.NewTransactionServiceClient(connection.connection)
+
+      response, err := client.GetTransactionTrees(*connection.ctx, &v1.GetTransactionsRequest {
+        LedgerId: ledgerId,
+        Filter: &v1.TransactionFilter {
+          FiltersByParty: partyMap,
+        },
+        Begin: offset,
+        Verbose: true,
+      })
+
+      if err != nil {
+        panic(err)
       }
-    }
+
+      ledgerContext.LogInfo(fmt.Sprintf("Starting listener thread %d", i))
+
+      for {
+        resp, err := response.Recv()
+        if err == nil {
+        TRANSACTION_LOOP:
+          for _, value := range resp.Transactions {
+            var tx Database.TransactionTable
+            res := db.Where("transaction_id = ?", value.TransactionId).First(&tx)
+            for (locked == true) {
+              ledgerContext.LogInfo(fmt.Sprintf("Listener %d: Waiting for lock to release to write transaction", i))
+            }
+            locked = true
+
+            dontGo := false
+
+            if res.Error == nil {
+              locked = false
+              ledgerContext.LogInfo(fmt.Sprintf("Listener %d: Already seen this transaction", i))
+              dontGo = true
+              break TRANSACTION_LOOP
+            }
+            if _, ok := inFlightTransaction[value.TransactionId]; ok {
+              ledgerContext.LogInfo(fmt.Sprintf("Listener %d: Transaction in flight", i))
+              locked = false // this transaction is already in flight; unlock
+              dontGo = true
+              break TRANSACTION_LOOP
+            }
+            ledgerContext.LogInfo(fmt.Sprintf("Listener %d: Hello", i))
+
+            inFlightTransaction[value.TransactionId] = value.TransactionId
+            locked = false
+            if !dontGo {
+              var eIds []string
+              for eventId, data := range value.EventsById {
+                created := data.GetCreated()
+                if created != nil {
+                  createChannel <- CreateEventWrapper {
+                      ContractID: created.ContractId,
+                      ContractKey: created.ContractKey,
+                      CreateArguments: created.CreateArguments,
+                      TemplateId: created.TemplateId,
+                      Witnesses: created.WitnessParties,
+                      Observers: created.Observers,
+                      Signatories: created.Signatories,
+                      EventId: created.EventId,
+                  }
+                  eIds = append(eIds, eventId)
+                } else {
+                  exercised := data.GetExercised()
+                  exercisedChannel <- ExercisedEventWrapper {
+                    EventId: exercised.EventId,
+                    ContractID: exercised.ContractId,
+                    TemplateId: exercised.TemplateId,
+                    Choice: exercised.Choice,
+                    ChoiceArgument: exercised.ChoiceArgument,
+                    ActingParties: exercised.ActingParties,
+                    Consuming: exercised.Consuming,
+                    Witnesses: exercised.WitnessParties,
+                    ChildEventIds: exercised.ChildEventIds,
+                    ExerciseResult: exercised.ExerciseResult,
+                  }
+                  eIds = append(eIds, eventId)
+                }
+              }
+              transactionChannel <- TransactionWrapper {
+                TransactionId: value.TransactionId,
+                CommandId: value.CommandId,
+                WorkflowId: value.WorkflowId,
+                Offset: value.Offset,
+                EffectiveAt: value.EffectiveAt.AsTime(),
+                EventIds: eIds,
+              }
+            }
+          }
+        }
+
+        if err != nil {
+          switch status.Code(err) {
+            case codes.Aborted:
+              if ledgerContext.Retry.Limit == ledgerContext.Retry.Count {
+                log.Fatalf("Hit retry limit")
+              }
+              ledgerContext.LogInfo(fmt.Sprintf("gRPC connection aborted, error message %s", err))
+              ledgerContext.LogInfo("Cleaning up and reattempting connection")
+              connection.connection.Close()
+              close(createChannel)
+              close(exercisedChannel)
+              close(workerConnection)
+              ledgerContext.Retry.Count = ledgerContext.Retry.Count + 1
+              ledgerContext.LogInfo("Ledger Thread died, bailing out of this thread")
+              return
+              //ledgerContext.WatchTransactionStream()
+            default:
+              log.Fatalf("Got unrecoverable gRPC error %s", err)
+          }
+        }
+      }
+    }()
+  }
+
+  for {
+    time.Sleep(time.Second * 100)
   }
 }
 
