@@ -136,31 +136,57 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
     panic(fmt.Sprintf("Failed to connect to db, error: %s", err))
   }
   MigrateTables(db)
+
+  // Table View for exercises and related data
+  db.Exec(`
+    CREATE OR REPLACE VIEW exercised AS
+      SELECT __exercised.*, e.offset, e.offset_ix, __offsets.effective_at, __transactions.command_id, __transactions.workflow_id, __transactions.transaction_id
+      FROM __events as e
+        INNER JOIN __exercised ON __exercised.event_id = e.event_id
+        INNER JOIN __transactions ON __transactions."offset" = e."offset"
+        INNER JOIN __offsets ON __offsets.offset_ix = e.offset_ix
+  `)
+
+  // Table View for creates ("contracts") and related data
+  db.Exec(`
+    CREATE OR REPLACE VIEW contract AS
+      SELECT __creates.*,  e."offset", e.offset_ix, __offsets.effective_at, __transactions.command_id, __transactions.workflow_id, __transactions.transaction_id
+      FROM __events as e
+        INNER JOIN __creates ON __creates.event_id = e.event_id
+        INNER JOIN __transactions ON __transactions."offset" = e."offset"
+        INNER JOIN __offsets ON __offsets.offset_ix = e.offset_ix
+  `)
+
+  // Table View for all active contracts
+  db.Exec(`
+    CREATE OR REPLACE VIEW active AS
+      SELECT __creates.contract_id, __creates.contract_key, __creates.payload, __creates.template_fqn, __creates.witnesses, __creates.observers, __creates.signatories, e.event_id, __transactions.transaction_id, e."offset_ix"
+      FROM __events AS e
+        INNER JOIN __creates ON __creates.event_id = e.event_id
+        LEFT OUTER JOIN __consuming ON __consuming.contract_id = __creates.contract_id
+        INNER JOIN __transactions ON __transactions."offset" = e."offset"
+      WHERE __consuming.contract_id IS NULL
+  `)
+
   db.Exec(`
     CREATE OR REPLACE FUNCTION active(template_id text default null, offset_end text default null)
       RETURNS TABLE(contract_id text, contract_key jsonb, payload jsonb, template_fqn text, witnesses text[], observers text[], signatories text[], event_id text, transaction_id text, "offset_ix" bigint)
-      LANGUAGE plpgsql VOLATILE
-      AS $BODY$
-        BEGIN
-          RETURN QUERY
-            SELECT __creates.contract_id as contract_id, __creates.contract_key, __creates.payload, __creates.template_fqn, __creates.witnesses, __creates.observers, __creates.signatories, e.event_id, __transactions.transaction_id, e."offset_ix"
-                FROM __events AS e
-                  RIGHT JOIN __creates ON __creates.event_id = e.event_id
-                  INNER JOIN __transactions ON __transactions."offset" = e."offset"
-                WHERE NOT EXISTS (SELECT __exercised.contract_id FROM __exercised WHERE __exercised.contract_id = __creates.contract_id AND __exercised.consuming)
-                AND
-                  CASE
-                    WHEN template_id IS NOT NULL THEN __creates.template_fqn LIKE FORMAT('%%%s%%', template_id)
-                    ELSE true
-                  END
-                AND
-                  CASE
-                    WHEN offset_end IS NOT NULL THEN e.offset_ix BETWEEN 0 AND (SELECT __offsets.offset_ix FROM __offsets WHERE __offsets."offset" = offset_end)
-                    ELSE true
-                  END;
-            RETURN;
-        END;
-     $BODY$;
+      BEGIN ATOMIC
+          SELECT * FROM active as a
+          WHERE CASE
+              WHEN template_id IS NOT NULL THEN a.template_fqn LIKE FORMAT('%%%s%%', template_id)
+              ELSE true
+            END
+          AND
+            CASE
+              WHEN offset_end IS NOT NULL THEN a.offset_ix BETWEEN 0 AND (
+                  SELECT __offsets.offset_ix
+                  FROM __offsets
+                  WHERE __offsets."offset" = offset_end
+                  LIMIT 1)
+              ELSE true
+            END;
+      END;
   `)
   db.Exec(`
     CREATE OR REPLACE FUNCTION lookup_contract(contract text)
@@ -213,8 +239,9 @@ func InitializePostgresDB(host string, user string, password string, dbname stri
           END IF;
         END;
       $func$
-
-
+  `)
+  db.Exec(`
+    CREATE INDEX IF NOT EXISTS consumed_contract_id ON __consuming USING BTREE(contract_id)
   `)
   //db.Exec(`
   //  CREATE INDEX IF NOT EXISTS event_ids_jsonb ON __transactions USING gin(event_ids);
